@@ -2,21 +2,49 @@
 import { Router } from "express";
 import path from "path";
 import fs from "fs";
-import { pool } from "../db/db.js";  // ✅
-import { mailer } from "../utils/mailer.js";
+import { pool } from "../db/db.js";
+
+// mailer is optional — don't crash if it's not configured
+let mailer = null;
+try {
+  const m = await import("../utils/mailer.js");
+  mailer = m.mailer;
+} catch (_) {
+  // no mailer config; we'll no-op later
+}
 
 const router = Router();
 
-// Config (fallbacks for local dev)
-const APP_ORIGIN = process.env.APP_ORIGIN || "http://localhost:5173"; // frontend
-const API_BASE   = process.env.API_BASE   || "http://localhost:5000"; // backend
+// ---------- Public URL helpers ----------
+const strip = (u) => (u || "").replace(/\/+$/, "");
+const first = (v) => (v || "").split(",")[0].trim();
 
-/**
- * POST /notify/share
- * body: { share_id }
- * Sends an email to shares.to_user_email with link + QR.
- * Works for both registered and not-registered recipients.
- */
+// LIVE fallbacks (you can still override with env)
+const FALLBACK_APP = "https://qr-project-react.vercel.app";   // Vercel (frontend)
+const FALLBACK_API = "https://qr-project-v0h4.onrender.com";  // Render (backend)
+
+function getPublicAppBase(req) {
+  const envBase = process.env.PUBLIC_APP_URL || process.env.APP_ORIGIN || FALLBACK_APP;
+  if (envBase) return strip(envBase);
+  const proto = first(req.headers["x-forwarded-proto"]) || req.protocol || "https";
+  const host  = first(req.headers["x-forwarded-host"])  || req.get("host") || "";
+  return `${proto}://${host}`;
+}
+
+function getPublicApiBase(req) {
+  const envBase = process.env.PUBLIC_API_URL || process.env.API_BASE || FALLBACK_API;
+  if (envBase) return strip(envBase);
+  const proto = first(req.headers["x-forwarded-proto"]) || req.protocol || "https";
+  const host  = first(req.headers["x-forwarded-host"])  || req.get("host") || "";
+  return `${proto}://${host}`;
+}
+
+// ------------------------------------------------------------
+// POST /notify/share
+// body: { share_id }
+// Sends an email to shares.to_user_email with link + QR.
+// Works for registered & unregistered recipients.
+// ------------------------------------------------------------
 router.post("/share", async (req, res) => {
   try {
     const { share_id } = req.body || {};
@@ -44,33 +72,38 @@ router.post("/share", async (req, res) => {
     );
     const isRegistered = !!reg.rowCount;
 
-    const shareLink = `${APP_ORIGIN}/share/${share.share_id}`;
-    const qrUrl = share.qr_code_path
-      ? `${API_BASE}/${share.qr_code_path}`.replace(/(?<!:)\/\/+/g, "/")
-      : null;
+    // Live bases
+    const APP_ORIGIN = getPublicAppBase(req); // e.g. https://qr-project-react.vercel.app
+    const API_BASE   = getPublicApiBase(req); // e.g. https://qr-project-v0h4.onrender.com
 
-    // Email body logic
+    // IMPORTANT: use hash route so Vercel SPA handles deep link without rewrites
+    const shareLink = `${APP_ORIGIN}/#/share/${share.share_id}`;
+
+    // Prefer the on-demand SVG QR (always available)
+    const qrSvgUrl = `${API_BASE}/shares/${share.share_id}/qr.svg`;
+
+    // Build email body
     const lines = [
       `Hi,`,
       ``,
       `${share.from_email} shared a document with you${share.file_name ? `: "${share.file_name}"` : ""}.`,
       `Access link: ${shareLink}`,
-      `Access type: ${share.access.toUpperCase()}`,
+      `Access type: ${String(share.access || "").toUpperCase()}`,
       ``,
       share.access === "private"
         ? (isRegistered
-           ? `Since this is PRIVATE: Log in with your registered email, then you'll receive an OTP to view/download.`
-           : `This is PRIVATE: Please register first using this email, then log in and complete OTP to view/download.`)
-        : `This is PUBLIC: Anyone with the link can view (download is disabled).`,
+            ? `PRIVATE: Please log in with your registered email; you'll receive an OTP to view/download.`
+            : `PRIVATE: Please register first with this email, then log in and complete OTP to view/download.`)
+        : `PUBLIC: Anyone with the link can view (download disabled).`,
       ``,
-      qrUrl ? `You can also scan the attached QR code (or open ${qrUrl}).` : ``,
+      `QR (open or download): ${qrSvgUrl}`,
       ``,
       `Thanks,`,
       `QR-Docs`,
-    ].filter(Boolean);
+    ];
 
-    // Try attaching QR image if present on disk (best effort)
-    let attachments = [];
+    // Best-effort PNG attachment if it exists on disk
+    const attachments = [];
     if (share.qr_code_path) {
       const abs = path.join(process.cwd(), share.qr_code_path);
       if (fs.existsSync(abs)) {
@@ -78,8 +111,23 @@ router.post("/share", async (req, res) => {
       }
     }
 
+    // If mailer isn't configured, don't fail the request
+    if (!mailer) {
+      return res.json({
+        ok: false,
+        message: "Email not configured on server; skipped sending",
+        preview: {
+          to: share.to_user_email,
+          subject: `Document shared with you${share.file_name ? ` — ${share.file_name}` : ""}`,
+          body: lines.join("\n"),
+          qrSvgUrl,
+        },
+        isRegistered,
+      });
+    }
+
     await mailer.sendMail({
-      from: process.env.EMAIL_USER,
+      from: process.env.EMAIL_USER || "no-reply@qr-docs",
       to: share.to_user_email,
       subject: `Document shared with you${share.file_name ? ` — ${share.file_name}` : ""}`,
       text: lines.join("\n"),

@@ -262,4 +262,58 @@ router.get("/:id", auth, async (req, res) => {
   }
 });
 
+// DELETE /shares/:id  (owner can revoke)
+router.delete("/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    // ensure the share belongs to the requester
+    const chk = await pool.query(
+      `SELECT share_id FROM shares WHERE share_id=$1 AND from_user_id=$2`,
+      [id, req.user.user_id]
+    );
+    if (!chk.rowCount) return res.status(404).json({ error: "Share not found" });
+
+    await pool.query(`DELETE FROM shares WHERE share_id=$1`, [id]);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("SHARE_DELETE_ERROR:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/** GET /shares/:id/qr.svg — vector QR (frontend link) */
+router.get("/:id/qr.svg", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const chk = await pool.query(`SELECT 1 FROM shares WHERE share_id=$1 LIMIT 1`, [id]);
+    if (chk.rowCount === 0) return res.status(404).send("Not found");
+
+    const APP_ORIGIN = getPublicAppBase(req);
+
+    // 🔴 OLD (breaks on Vercel deep link)
+    // const shareUrl = `${APP_ORIGIN}/share/${id}`;
+
+    // 🟢 NEW: use the HASH route so the SPA can handle it without rewrites
+    const shareUrl = `${APP_ORIGIN}/#/share/${id}`;
+
+    const svg = await QRCode.toString(shareUrl, {
+      type: "svg",
+      errorCorrectionLevel: "H",
+      margin: 3,
+      width: 512,
+      color: { dark: "#000000", light: "#FFFFFF" },
+    });
+
+    res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.status(200).send(svg);
+  } catch (e) {
+    console.error("QR_SVG_ERROR:", e);
+    return res.status(500).send("QR generation failed");
+  }
+});
+
+
+
 export default router;

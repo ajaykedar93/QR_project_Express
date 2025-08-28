@@ -17,8 +17,8 @@ function exposeHeaders(res) {
   );
 }
 
-/** helper: check access for view/download via share_id */
-async function canAccess({ document_id, share_id, wantDownload, user_id }) {
+/** helper: check access for view/download via share_id (email-based for private) */
+async function canAccess({ document_id, share_id, wantDownload, email }) {
   if (!share_id) return { ok: false, msg: "Missing share_id" };
 
   const s = await pool.query(
@@ -35,19 +35,27 @@ async function canAccess({ document_id, share_id, wantDownload, user_id }) {
     return { ok: false, msg: "Share expired" };
   }
 
+  // PUBLIC: inline view allowed; download disabled
   if (sh.access === "public") {
     if (wantDownload) return { ok: false, msg: "Public shares are view-only" };
     return { ok: true };
   }
 
-  // private: need verified OTP for this share + user
+  // PRIVATE: must have verified OTP for this share + email
+  if (!email) return { ok: false, msg: "OTP verification required" };
+
   const v = await pool.query(
-    `SELECT 1 FROM otp_verifications 
-      WHERE share_id=$1 AND user_id=$2 AND is_verified=TRUE 
-      ORDER BY created_at DESC LIMIT 1`,
-    [share_id, user_id || null]
+    `SELECT 1
+       FROM otp_verifications
+      WHERE share_id=$1
+        AND LOWER(email)=LOWER($2)
+        AND is_verified=TRUE
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [share_id, email]
   );
   if (!v.rowCount) return { ok: false, msg: "OTP verification required" };
+
   return { ok: true };
 }
 
@@ -103,11 +111,9 @@ router.delete("/:id", auth, async (req, res) => {
 function streamFile(res, absPath, { mime, filename, inline = true }) {
   exposeHeaders(res);
 
-  // Basic stat for size
   const st = fs.statSync(absPath);
   const size = st.size;
 
-  // Content headers
   res.setHeader("Content-Type", mime || "application/octet-stream");
 
   // RFC 5987 filename* + legacy filename=
@@ -119,16 +125,12 @@ function streamFile(res, absPath, { mime, filename, inline = true }) {
   );
   res.setHeader("Content-Length", String(size));
   res.setHeader("Accept-Ranges", "bytes");
-  // Preview files should generally not be cached too aggressively for private content
   res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
-
-  // NOTE: minimal range support (serves full for simplicity).
-  // If you need true scrubbing for big videos, implement Range parsing here.
 
   fs.createReadStream(absPath).pipe(res);
 }
 
-/** GET /documents/view/:id?share_id=... — inline view (public OK, private needs OTP) */
+/** GET /documents/view/:id?share_id=... — inline view (public OK, private needs OTP/email) */
 router.get("/view/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -138,8 +140,8 @@ router.get("/view/:id", async (req, res) => {
     const doc = dres.rows[0];
     if (!doc) return res.status(404).send("Not found");
 
-    const user_id = req.headers["x-user-id"] || null;
-    const check = await canAccess({ document_id: id, share_id, wantDownload: false, user_id });
+    const email = req.headers["x-user-email"] || ""; // verified email from frontend (sessionStorage)
+    const check = await canAccess({ document_id: id, share_id, wantDownload: false, email });
     if (!check.ok) return res.status(403).send(check.msg);
 
     const abs = path.join(process.cwd(), doc.file_path);
@@ -148,12 +150,11 @@ router.get("/view/:id", async (req, res) => {
     streamFile(res, abs, { mime: doc.mime_type, filename: doc.file_name, inline: true });
   } catch (e) {
     console.error("VIEW_ERROR:", e);
-    // Keep it text so the iframe shows a readable error
     res.status(500).send("Unable to open document");
   }
 });
 
-/** GET /documents/download/:id?share_id=... — download (private+OTP only) */
+/** GET /documents/download/:id?share_id=... — download (private+OTP/email only) */
 router.get("/download/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -163,8 +164,8 @@ router.get("/download/:id", async (req, res) => {
     const doc = dres.rows[0];
     if (!doc) return res.status(404).send("Not found");
 
-    const user_id = req.headers["x-user-id"] || null;
-    const check = await canAccess({ document_id: id, share_id, wantDownload: true, user_id });
+    const email = req.headers["x-user-email"] || "";
+    const check = await canAccess({ document_id: id, share_id, wantDownload: true, email });
     if (!check.ok) return res.status(403).send(check.msg);
 
     const abs = path.join(process.cwd(), doc.file_path);
