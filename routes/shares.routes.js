@@ -1,0 +1,242 @@
+// routes/shares.routes.js
+import { Router } from "express";
+import { pool } from "../db/db.js";
+import { auth } from "../middleware/auth.js";
+import QRCode from "qrcode";
+import path from "path";
+import fs from "fs";
+import dayjs from "dayjs";
+
+// OPTIONAL email transport; safe if not present
+let mailer = null;
+try {
+  const m = await import("../utils/mailer.js");
+  mailer = m.mailer;
+} catch (_) {
+  // mailer not configured; ignore
+}
+
+const router = Router();
+
+// --- CONFIG ---
+const APP_ORIGIN = "http://10.207.99.247:5173"; // Frontend base (used in QR)
+const API_BASE   =  "http://localhost:5000";     // Backend base (for absolute QR path in email)
+
+// --- QR output directory (for PNGs) ---
+const QR_DIR = path.join(process.cwd(), "qrcodes");
+if (!fs.existsSync(QR_DIR)) fs.mkdirSync(QR_DIR, { recursive: true });
+
+/**
+ * POST /shares/create
+ * body: { document_id, to_user_email?, access: 'private'|'public', expiry_time? }
+ * returns: { share: {...}, recipientExists: boolean }
+ */
+router.post("/create", auth, async (req, res) => {
+  try {
+    let { document_id, to_user_email, access = "private", expiry_time } = req.body || {};
+    if (!document_id) return res.status(400).json({ error: "document_id required" });
+    if (!["private", "public"].includes(access)) return res.status(400).json({ error: "invalid access" });
+
+    // validate doc ownership
+    const d = await pool.query(
+      `SELECT document_id, file_name FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
+      [document_id, req.user.user_id]
+    );
+    const doc = d.rows[0];
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    // recipient existence
+    let recipientExists = false;
+    let to_user_id = null;
+    let toEmailNorm = null;
+
+    if (to_user_email && String(to_user_email).trim()) {
+      toEmailNorm = String(to_user_email).trim();
+      const r = await pool.query(
+        `SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+        [toEmailNorm]
+      );
+      if (r.rowCount) {
+        recipientExists = true;
+        to_user_id = r.rows[0].user_id;
+      }
+    }
+
+    // expiry normalize
+    let expirySql = null;
+    if (expiry_time) {
+      const dt = dayjs(expiry_time);
+      if (dt.isValid()) expirySql = dt.toISOString();
+    }
+
+    // create share
+    const ins = `
+      INSERT INTO shares (document_id, from_user_id, to_user_id, to_user_email, access, expiry_time)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      RETURNING *`;
+    const { rows } = await pool.query(ins, [
+      document_id,
+      req.user.user_id,
+      to_user_id,
+      toEmailNorm,
+      access,
+      expirySql,
+    ]);
+    const share = rows[0];
+
+    // generate QR PNG that encodes FRONTEND URL (works on mobile)
+    const shareUrl = `${APP_ORIGIN}/share/${share.share_id}`;
+    const qrPath = path.join(QR_DIR, `${share.share_id}.png`);
+    await QRCode.toFile(qrPath, shareUrl, {
+      width: 600,
+      margin: 3,
+      errorCorrectionLevel: "H",
+      color: { dark: "#000000", light: "#FFFFFFFF" },
+    });
+
+    // store relative path so it can be served as /qrcodes/...
+    const relQrPath = `qrcodes/${path.basename(qrPath)}`;
+    const upd = await pool.query(
+      `UPDATE shares SET qr_code_path=$1 WHERE share_id=$2 RETURNING *`,
+      [relQrPath, share.share_id]
+    );
+    const saved = upd.rows[0];
+
+    // optional email notify
+    if (mailer && toEmailNorm) {
+      const lines = [
+        `Hi,`,
+        ``,
+        `${req.user.email} shared a document with you${doc.file_name ? `: "${doc.file_name}"` : ""}.`,
+        `Access link: ${shareUrl}`,
+        `Access type: ${access.toUpperCase()}`,
+        ``,
+        access === "private"
+          ? (recipientExists
+              ? `PRIVATE: Please login with your registered email; you'll receive an OTP to view/download.`
+              : `PRIVATE: Please register first with this email, then login and complete OTP to view/download.`)
+          : `PUBLIC: Anyone with the link can view (download disabled).`,
+        ``,
+        `You can also scan the attached QR image or open: ${API_BASE}/${relQrPath}`.replace(/(?<!:)\/\/+/g, "/"),
+        ``,
+        `Thanks,`,
+        `QR-Docs`,
+      ].join("\n");
+
+      const abs = path.join(process.cwd(), relQrPath);
+      const attachments = fs.existsSync(abs) ? [{ filename: "share-qr.png", path: abs }] : [];
+      try {
+        await mailer.sendMail({
+          from: process.env.EMAIL_USER,
+          to: toEmailNorm,
+          subject: `Document shared with you${doc.file_name ? ` — ${doc.file_name}` : ""}`,
+          text: lines,
+          attachments,
+        });
+      } catch (mailErr) {
+        console.warn("MAIL_SEND_WARN:", mailErr?.message || mailErr);
+      }
+    }
+
+    return res.json({ share: saved, recipientExists });
+  } catch (e) {
+    console.error("SHARE_CREATE_ERROR:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * GET /shares/:id/qr.svg
+ * Crisp vector QR (no file saved); encodes FRONTEND URL
+ */
+router.get("/:id/qr.svg", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // optional: verify share exists
+    const chk = await pool.query(`SELECT 1 FROM shares WHERE share_id=$1 LIMIT 1`, [id]);
+    if (chk.rowCount === 0) return res.status(404).send("Not found");
+
+    const shareUrl = `${APP_ORIGIN}/share/${id}`;
+    const svg = await QRCode.toString(shareUrl, {
+      type: "svg",
+      errorCorrectionLevel: "H",
+      margin: 3,
+      width: 512,
+      color: { dark: "#000000", light: "#FFFFFF" },
+    });
+
+    res.setHeader("Content-Type", "image/svg+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.status(200).send(svg);
+  } catch (e) {
+    console.error("QR_SVG_ERROR:", e);
+    return res.status(500).send("QR generation failed");
+  }
+});
+
+/**
+ * GET /shares/mine
+ * Shares I created
+ */
+router.get("/mine", auth, async (req, res) => {
+  try {
+    const q = `
+      SELECT s.*, d.file_name
+      FROM shares s
+      JOIN documents d ON d.document_id = s.document_id
+      WHERE s.from_user_id = $1
+      ORDER BY s.created_at DESC`;
+    const { rows } = await pool.query(q, [req.user.user_id]);
+    res.json(rows);
+  } catch (e) {
+    console.error("SHARE_MINE_ERROR:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * GET /shares/received
+ * Shares sent to me (linked by to_user_id or by my email)
+ */
+router.get("/received", auth, async (req, res) => {
+  try {
+    const q = `
+      SELECT s.*, d.file_name
+      FROM shares s
+      JOIN documents d ON d.document_id = s.document_id
+      WHERE s.to_user_id = $1
+         OR (s.to_user_email IS NOT NULL AND LOWER(s.to_user_email)=LOWER($2))
+      ORDER BY s.created_at DESC`;
+    const { rows } = await pool.query(q, [req.user.user_id, req.user.email]);
+    res.json(rows);
+  } catch (e) {
+    console.error("SHARE_RECEIVED_ERROR:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
+ * GET /shares/:id
+ * Basic details for a share (used by ShareAccess page if needed)
+ */
+router.get("/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const q = `
+      SELECT s.*, d.file_name, d.mime_type, d.file_path
+      FROM shares s
+      JOIN documents d ON d.document_id = s.document_id
+      WHERE s.share_id = $1
+      LIMIT 1`;
+    const { rows } = await pool.query(q, [id]);
+    const share = rows[0];
+    if (!share) return res.status(404).json({ error: "Not found" });
+    res.json(share);
+  } catch (e) {
+    console.error("SHARE_GET_ERROR:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+export default router;
