@@ -98,8 +98,10 @@ router.post("/create", auth, async (req, res) => {
     const APP_ORIGIN = getPublicAppBase(req); // Vercel URL
     const API_BASE   = getPublicApiBase(req); // Render URL
 
-    // QR encodes FRONTEND URL
-    const shareUrl = `${APP_ORIGIN}/share/${share.share_id}`;
+   
+    
+// AFTER (hash route so no server rewrite needed)
+const shareUrl = `${APP_ORIGIN}/#/share/${share.share_id}`;
     const qrPath = path.join(QR_DIR, `${share.share_id}.png`);
     await QRCode.toFile(qrPath, shareUrl, {
       width: 600,
