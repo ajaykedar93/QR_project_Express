@@ -9,6 +9,14 @@ import dayjs from "dayjs";
 
 const router = Router();
 
+/** CORS: expose headers so frontend can read filename/type/size via axios */
+function exposeHeaders(res) {
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Content-Disposition, Content-Type, Content-Length, Accept-Ranges"
+  );
+}
+
 /** helper: check access for view/download via share_id */
 async function canAccess({ document_id, share_id, wantDownload, user_id }) {
   if (!share_id) return { ok: false, msg: "Missing share_id" };
@@ -82,53 +90,91 @@ router.delete("/:id", auth, async (req, res) => {
   if (!doc) return res.status(404).json({ error: "Not found" });
 
   // best-effort delete from disk
-  try { fs.unlinkSync(doc.file_path); } catch {}
+  try {
+    const abs = path.join(process.cwd(), doc.file_path);
+    if (fs.existsSync(abs)) fs.unlinkSync(abs);
+  } catch (_) {}
 
   await pool.query(`DELETE FROM documents WHERE document_id=$1`, [id]);
   res.json({ success: true });
 });
 
+/** Shared stream helper (adds headers + streams file) */
+function streamFile(res, absPath, { mime, filename, inline = true }) {
+  exposeHeaders(res);
+
+  // Basic stat for size
+  const st = fs.statSync(absPath);
+  const size = st.size;
+
+  // Content headers
+  res.setHeader("Content-Type", mime || "application/octet-stream");
+
+  // RFC 5987 filename* + legacy filename=
+  const safe = encodeURIComponent(filename || path.basename(absPath));
+  const dispType = inline ? "inline" : "attachment";
+  res.setHeader(
+    "Content-Disposition",
+    `${dispType}; filename="${safe}"; filename*=UTF-8''${safe}`
+  );
+  res.setHeader("Content-Length", String(size));
+  res.setHeader("Accept-Ranges", "bytes");
+  // Preview files should generally not be cached too aggressively for private content
+  res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
+
+  // NOTE: minimal range support (serves full for simplicity).
+  // If you need true scrubbing for big videos, implement Range parsing here.
+
+  fs.createReadStream(absPath).pipe(res);
+}
+
 /** GET /documents/view/:id?share_id=... — inline view (public OK, private needs OTP) */
 router.get("/view/:id", async (req, res) => {
-  const { id } = req.params;
-  const { share_id } = req.query;
+  try {
+    const { id } = req.params;
+    const { share_id } = req.query;
 
-  const dres = await pool.query(`SELECT * FROM documents WHERE document_id=$1`, [id]);
-  const doc = dres.rows[0];
-  if (!doc) return res.status(404).send("Not found");
+    const dres = await pool.query(`SELECT * FROM documents WHERE document_id=$1`, [id]);
+    const doc = dres.rows[0];
+    if (!doc) return res.status(404).send("Not found");
 
-  // optional user id header for private access check
-  const user_id = req.headers["x-user-id"] || null;
-  const check = await canAccess({ document_id: id, share_id, wantDownload: false, user_id });
-  if (!check.ok) return res.status(403).send(check.msg);
+    const user_id = req.headers["x-user-id"] || null;
+    const check = await canAccess({ document_id: id, share_id, wantDownload: false, user_id });
+    if (!check.ok) return res.status(403).send(check.msg);
 
-  const abs = path.join(process.cwd(), doc.file_path);
-  if (!fs.existsSync(abs)) return res.status(404).send("File missing");
+    const abs = path.join(process.cwd(), doc.file_path);
+    if (!fs.existsSync(abs)) return res.status(404).send("File missing");
 
-  res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
-  res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(doc.file_name)}"`);
-  fs.createReadStream(abs).pipe(res);
+    streamFile(res, abs, { mime: doc.mime_type, filename: doc.file_name, inline: true });
+  } catch (e) {
+    console.error("VIEW_ERROR:", e);
+    // Keep it text so the iframe shows a readable error
+    res.status(500).send("Unable to open document");
+  }
 });
 
 /** GET /documents/download/:id?share_id=... — download (private+OTP only) */
 router.get("/download/:id", async (req, res) => {
-  const { id } = req.params;
-  const { share_id } = req.query;
+  try {
+    const { id } = req.params;
+    const { share_id } = req.query;
 
-  const dres = await pool.query(`SELECT * FROM documents WHERE document_id=$1`, [id]);
-  const doc = dres.rows[0];
-  if (!doc) return res.status(404).send("Not found");
+    const dres = await pool.query(`SELECT * FROM documents WHERE document_id=$1`, [id]);
+    const doc = dres.rows[0];
+    if (!doc) return res.status(404).send("Not found");
 
-  const user_id = req.headers["x-user-id"] || null;
-  const check = await canAccess({ document_id: id, share_id, wantDownload: true, user_id });
-  if (!check.ok) return res.status(403).send(check.msg);
+    const user_id = req.headers["x-user-id"] || null;
+    const check = await canAccess({ document_id: id, share_id, wantDownload: true, user_id });
+    if (!check.ok) return res.status(403).send(check.msg);
 
-  const abs = path.join(process.cwd(), doc.file_path);
-  if (!fs.existsSync(abs)) return res.status(404).send("File missing");
+    const abs = path.join(process.cwd(), doc.file_path);
+    if (!fs.existsSync(abs)) return res.status(404).send("File missing");
 
-  res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
-  res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(doc.file_name)}"`);
-  fs.createReadStream(abs).pipe(res);
+    streamFile(res, abs, { mime: doc.mime_type, filename: doc.file_name, inline: false });
+  } catch (e) {
+    console.error("DOWNLOAD_ERROR:", e);
+    res.status(500).send("Download failed");
+  }
 });
 
 export default router;

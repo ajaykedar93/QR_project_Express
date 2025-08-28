@@ -1,4 +1,3 @@
-// routes/shares.routes.js
 import { Router } from "express";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
@@ -7,48 +6,43 @@ import path from "path";
 import fs from "fs";
 import dayjs from "dayjs";
 
-// OPTIONAL email transport; safe if not present
+// OPTIONAL mailer
 let mailer = null;
 try {
   const m = await import("../utils/mailer.js");
   mailer = m.mailer;
-} catch (_) {
-  // mailer not configured; ignore
-}
+} catch {}
 
 const router = Router();
 
-// -------- CONFIG (LIVE on Render) --------
-// Prefer env vars if you add them later; otherwise use the live Render base
-const FALLBACK_APP = "https://qr-project-v0h4.onrender.com"; // frontend/app base used in QR content
-const FALLBACK_API = "https://qr-project-v0h4.onrender.com"; // backend/api base used for absolute file links
+// Live bases (env first, then fallbacks)
+const FALLBACK_APP = "https://qr-project-react.vercel.app";   // Vercel
+const FALLBACK_API = "https://qr-project-v0h4.onrender.com";  // Render
+
+const strip = (u) => (u || "").replace(/\/+$/, "");
+const first = (v) => (v || "").split(",")[0].trim();
 
 function getPublicAppBase(req) {
   const envBase = process.env.PUBLIC_APP_URL || FALLBACK_APP;
-  if (envBase) return envBase.replace(/\/+$/, "");
-  // headers fallback (kept for completeness)
-  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
-  const host  = (req.headers["x-forwarded-host"]  || req.get("host") || "").split(",")[0].trim();
+  if (envBase) return strip(envBase);
+  const proto = first(req.headers["x-forwarded-proto"]) || req.protocol || "https";
+  const host  = first(req.headers["x-forwarded-host"])  || req.get("host") || "";
   return `${proto}://${host}`;
 }
 
 function getPublicApiBase(req) {
   const envBase = process.env.PUBLIC_API_URL || FALLBACK_API;
-  if (envBase) return envBase.replace(/\/+$/, "");
-  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
-  const host  = (req.headers["x-forwarded-host"]  || req.get("host") || "").split(",")[0].trim();
+  if (envBase) return strip(envBase);
+  const proto = first(req.headers["x-forwarded-proto"]) || req.protocol || "https";
+  const host  = first(req.headers["x-forwarded-host"])  || req.get("host") || "";
   return `${proto}://${host}`;
 }
 
-// --- QR output directory (for PNGs) ---
+// QR output dir
 const QR_DIR = path.join(process.cwd(), "qrcodes");
 if (!fs.existsSync(QR_DIR)) fs.mkdirSync(QR_DIR, { recursive: true });
 
-/**
- * POST /shares/create
- * body: { document_id, to_user_email?, access: 'private'|'public', expiry_time? }
- * returns: { share: {...}, recipientExists: boolean }
- */
+/** POST /shares/create */
 router.post("/create", auth, async (req, res) => {
   try {
     let { document_id, to_user_email, access = "private", expiry_time } = req.body || {};
@@ -67,7 +61,6 @@ router.post("/create", auth, async (req, res) => {
     let recipientExists = false;
     let to_user_id = null;
     let toEmailNorm = null;
-
     if (to_user_email && String(to_user_email).trim()) {
       toEmailNorm = String(to_user_email).trim();
       const r = await pool.query(
@@ -80,7 +73,7 @@ router.post("/create", auth, async (req, res) => {
       }
     }
 
-    // expiry normalize
+    // expiry
     let expirySql = null;
     if (expiry_time) {
       const dt = dayjs(expiry_time);
@@ -102,11 +95,10 @@ router.post("/create", auth, async (req, res) => {
     ]);
     const share = rows[0];
 
-    // build bases (live)
-    const APP_ORIGIN = getPublicAppBase(req); // -> https://qr-project-v0h4.onrender.com
-    const API_BASE   = getPublicApiBase(req); // -> https://qr-project-v0h4.onrender.com
+    const APP_ORIGIN = getPublicAppBase(req); // Vercel URL
+    const API_BASE   = getPublicApiBase(req); // Render URL
 
-    // generate QR PNG that encodes FRONTEND URL (works on any device)
+    // QR encodes FRONTEND URL
     const shareUrl = `${APP_ORIGIN}/share/${share.share_id}`;
     const qrPath = path.join(QR_DIR, `${share.share_id}.png`);
     await QRCode.toFile(qrPath, shareUrl, {
@@ -116,7 +108,6 @@ router.post("/create", auth, async (req, res) => {
       color: { dark: "#000000", light: "#FFFFFFFF" },
     });
 
-    // store relative path so it can be served as /qrcodes/...
     const relQrPath = `qrcodes/${path.basename(qrPath)}`;
     const upd = await pool.query(
       `UPDATE shares SET qr_code_path=$1 WHERE share_id=$2 RETURNING *`,
@@ -160,22 +151,18 @@ router.post("/create", auth, async (req, res) => {
       }
     }
 
-    return res.json({ share: saved, recipientExists });
+    const absolute_qr_url = `${strip(getPublicApiBase(req))}/${relQrPath}`.replace(/(?<!:)\/\/+/g, "/");
+    return res.json({ share: { ...saved, absolute_qr_url }, recipientExists });
   } catch (e) {
     console.error("SHARE_CREATE_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
   }
 });
 
-/**
- * GET /shares/:id/qr.svg
- * Crisp vector QR (no file saved); encodes FRONTEND URL
- */
+/** GET /shares/:id/qr.svg — vector QR (frontend link) */
 router.get("/:id/qr.svg", async (req, res) => {
   try {
     const { id } = req.params;
-
-    // optional: verify share exists
     const chk = await pool.query(`SELECT 1 FROM shares WHERE share_id=$1 LIMIT 1`, [id]);
     if (chk.rowCount === 0) return res.status(404).send("Not found");
 
@@ -199,10 +186,7 @@ router.get("/:id/qr.svg", async (req, res) => {
   }
 });
 
-/**
- * GET /shares/mine
- * Shares I created
- */
+/** GET /shares/mine */
 router.get("/mine", auth, async (req, res) => {
   try {
     const q = `
@@ -219,10 +203,7 @@ router.get("/mine", auth, async (req, res) => {
   }
 });
 
-/**
- * GET /shares/received
- * Shares sent to me (linked by to_user_id or by my email)
- */
+/** GET /shares/received */
 router.get("/received", auth, async (req, res) => {
   try {
     const q = `
@@ -240,10 +221,26 @@ router.get("/received", auth, async (req, res) => {
   }
 });
 
-/**
- * GET /shares/:id
- * Basic details for a share (used by ShareAccess page if needed)
- */
+/** GET /shares/:id/minimal — used by ShareAccess */
+router.get("/:id/minimal", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const q = `
+      SELECT s.share_id, s.document_id, s.access, s.expiry_time
+      FROM shares s
+      WHERE s.share_id = $1
+      LIMIT 1`;
+    const { rows } = await pool.query(q, [id]);
+    const share = rows[0];
+    if (!share) return res.status(404).json({ error: "Not found" });
+    res.json(share);
+  } catch (e) {
+    console.error("SHARE_MINIMAL_ERROR:", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/** GET /shares/:id — full (if needed) */
 router.get("/:id", auth, async (req, res) => {
   try {
     const { id } = req.params;
