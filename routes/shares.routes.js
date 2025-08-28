@@ -18,9 +18,27 @@ try {
 
 const router = Router();
 
-// --- CONFIG ---
-const APP_ORIGIN = "http://10.207.99.247:5173"; // Frontend base (used in QR)
-const API_BASE   =  "http://localhost:5000";     // Backend base (for absolute QR path in email)
+// -------- CONFIG (LIVE on Render) --------
+// Prefer env vars if you add them later; otherwise use the live Render base
+const FALLBACK_APP = "https://qr-project-v0h4.onrender.com"; // frontend/app base used in QR content
+const FALLBACK_API = "https://qr-project-v0h4.onrender.com"; // backend/api base used for absolute file links
+
+function getPublicAppBase(req) {
+  const envBase = process.env.PUBLIC_APP_URL || FALLBACK_APP;
+  if (envBase) return envBase.replace(/\/+$/, "");
+  // headers fallback (kept for completeness)
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  const host  = (req.headers["x-forwarded-host"]  || req.get("host") || "").split(",")[0].trim();
+  return `${proto}://${host}`;
+}
+
+function getPublicApiBase(req) {
+  const envBase = process.env.PUBLIC_API_URL || FALLBACK_API;
+  if (envBase) return envBase.replace(/\/+$/, "");
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  const host  = (req.headers["x-forwarded-host"]  || req.get("host") || "").split(",")[0].trim();
+  return `${proto}://${host}`;
+}
 
 // --- QR output directory (for PNGs) ---
 const QR_DIR = path.join(process.cwd(), "qrcodes");
@@ -84,7 +102,11 @@ router.post("/create", auth, async (req, res) => {
     ]);
     const share = rows[0];
 
-    // generate QR PNG that encodes FRONTEND URL (works on mobile)
+    // build bases (live)
+    const APP_ORIGIN = getPublicAppBase(req); // -> https://qr-project-v0h4.onrender.com
+    const API_BASE   = getPublicApiBase(req); // -> https://qr-project-v0h4.onrender.com
+
+    // generate QR PNG that encodes FRONTEND URL (works on any device)
     const shareUrl = `${APP_ORIGIN}/share/${share.share_id}`;
     const qrPath = path.join(QR_DIR, `${share.share_id}.png`);
     await QRCode.toFile(qrPath, shareUrl, {
@@ -127,7 +149,7 @@ router.post("/create", auth, async (req, res) => {
       const attachments = fs.existsSync(abs) ? [{ filename: "share-qr.png", path: abs }] : [];
       try {
         await mailer.sendMail({
-          from: process.env.EMAIL_USER,
+          from: process.env.EMAIL_USER || "no-reply@qr-docs",
           to: toEmailNorm,
           subject: `Document shared with you${doc.file_name ? ` — ${doc.file_name}` : ""}`,
           text: lines,
@@ -157,7 +179,9 @@ router.get("/:id/qr.svg", async (req, res) => {
     const chk = await pool.query(`SELECT 1 FROM shares WHERE share_id=$1 LIMIT 1`, [id]);
     if (chk.rowCount === 0) return res.status(404).send("Not found");
 
+    const APP_ORIGIN = getPublicAppBase(req);
     const shareUrl = `${APP_ORIGIN}/share/${id}`;
+
     const svg = await QRCode.toString(shareUrl, {
       type: "svg",
       errorCorrectionLevel: "H",
