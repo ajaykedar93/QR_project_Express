@@ -1,15 +1,37 @@
 // middleware/auth.js
 import jwt from "jsonwebtoken";
 
+/**
+ * Express middleware to authenticate requests using JWT.
+ *
+ * - Expects: Authorization: Bearer <token>
+ * - On success: attaches { user_id, email } to req.user
+ * - On failure: responds 401
+ */
 export function auth(req, res, next) {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "No token" });
-
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = { user_id: payload.user_id, email: payload.email };
+    const header = req.headers.authorization || "";
+    const [scheme, token] = header.split(" ");
+
+    if (!scheme || scheme.toLowerCase() !== "bearer" || !token) {
+      return res.status(401).json({ error: "Missing or malformed token" });
+    }
+
+    const secret = process.env.JWT_SECRET || "dev-secret";
+    if (secret === "dev-secret") {
+      console.warn("⚠️ JWT_SECRET not set. Using fallback dev-secret.");
+    }
+
+    const payload = jwt.verify(token, secret);
+
+    req.user = {
+      user_id: payload.user_id,
+      email: payload.email,
+    };
+
     next();
-  } catch {
-    res.status(401).json({ error: "Invalid token" });
+  } catch (err) {
+    console.error("AUTH_ERROR:", err.message);
+    return res.status(401).json({ error: "Invalid or expired token" });
   }
 }
