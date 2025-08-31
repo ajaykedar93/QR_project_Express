@@ -7,31 +7,35 @@ import { mailer } from "../utils/mailer.js";
 
 const router = Router();
 
-// FRONTEND URL where users open links (your Vercel URL)
+// Frontend URL where recipients open shares
 const APP_URL = "https://qr-project-react-n8xx.vercel.app";
 
-/** Build the frontend link that recipients will open */
 function buildShareUrl(shareId) {
   return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareId)}`;
 }
-
-/** Small helper */
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
 /* ============================================================
   CREATE SHARE
   POST /shares  (auth)
-  body: { document_id, to_email?, expiry_time? (ISO) }
+  body: { document_id, to_email?, expiry_time? (ISO), access? ("private"|"public") }
 ============================================================ */
 router.post("/", auth, async (req, res) => {
   try {
-    let { document_id, to_email = "", expiry_time = null } = req.body || {};
+    let {
+      document_id,
+      to_email = "",
+      expiry_time = null,
+      access = null, // optional explicit access
+    } = req.body || {};
+
     document_id = String(document_id || "").trim();
     to_email = String(to_email || "").trim();
+    access = access ? String(access).toLowerCase() : null;
 
     if (!document_id) return res.status(400).json({ error: "document_id required" });
 
-    // Owner check
+    // owner check
     const owns = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
       [document_id, req.user.user_id]
@@ -42,20 +46,32 @@ router.post("/", auth, async (req, res) => {
       return res.status(400).json({ error: "expiry_time must be in the future" });
     }
 
-    // Determine recipient / access
+    // resolve recipient registration
     let to_user_id = null;
-    let access = "public";
     if (to_email) {
       const u = await pool.query(
         `SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
         [to_email]
       );
-      if (u.rowCount) {
-        to_user_id = u.rows[0].user_id;
-        access = "private";
-      } else {
-        access = "public";
+      if (u.rowCount) to_user_id = u.rows[0].user_id;
+    }
+
+    // decide access
+    // if explicit provided, enforce rules; else infer: registered => private, else public
+    let finalAccess;
+    if (access === "private") {
+      if (!to_email) {
+        return res.status(400).json({ error: "Private share requires recipient email" });
       }
+      if (!to_user_id) {
+        return res.status(400).json({ error: "Recipient email must be registered for private shares" });
+      }
+      finalAccess = "private";
+    } else if (access === "public") {
+      finalAccess = "public";
+    } else {
+      // legacy implicit behavior
+      finalAccess = to_user_id ? "private" : "public";
     }
 
     const ins = `
@@ -68,14 +84,15 @@ router.post("/", auth, async (req, res) => {
       req.user.user_id,
       to_user_id,
       to_user_id ? null : (to_email || null),
-      access,
+      finalAccess,
       expiry_time || null,
     ]);
 
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error("SHARE_CREATE_ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    // unique or trigger errors bubble up as 400
+    return res.status(400).json({ error: err?.message || "Cannot create share" });
   }
 });
 
@@ -172,8 +189,8 @@ router.get("/:share_id", auth, async (req, res) => {
 });
 
 /* ============================================================
-  MINIMAL (for ShareAccess & QR)
-  GET /shares/:share_id/minimal  (public)
+  MINIMAL (public)
+  GET /shares/:share_id/minimal
   -> { share_id, document_id, access, to_user_email }
 ============================================================ */
 router.get("/:share_id/minimal", async (req, res) => {
@@ -207,7 +224,7 @@ router.get("/:share_id/minimal", async (req, res) => {
 });
 
 /* ============================================================
-  REVOKE SHARE (owner)
+  REVOKE (owner)
   POST /shares/:share_id/revoke  (auth)
 ============================================================ */
 router.post("/:share_id/revoke", auth, async (req, res) => {
@@ -232,7 +249,7 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
 });
 
 /* ============================================================
-  SEND OTP (private shares)
+  SEND OTP (private)
   POST /shares/:share_id/otp/send
   body: { email }
 ============================================================ */
@@ -252,7 +269,6 @@ router.post("/:share_id/otp/send", async (req, res) => {
       return res.status(403).json({ error: "Share expired" });
     }
 
-    // user must be registered
     const ures = await pool.query(
       `SELECT user_id, email FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
       [email]
@@ -260,7 +276,7 @@ router.post("/:share_id/otp/send", async (req, res) => {
     if (!ures.rowCount) return res.status(400).json({ error: "User must register first" });
     const user = ures.rows[0];
 
-    // enforce intended recipient
+    // intended recipient check
     if (sh.to_user_id && String(sh.to_user_id) !== String(user.user_id)) {
       return res.status(403).json({ error: "Not the intended recipient" });
     }
@@ -281,7 +297,6 @@ router.post("/:share_id/otp/send", async (req, res) => {
     `;
     const { rows } = await pool.query(ins, [user.user_id, share_id, otp, expiry]);
 
-    // email OTP
     await mailer.sendMail({
       from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
       to: user.email,
@@ -289,7 +304,6 @@ router.post("/:share_id/otp/send", async (req, res) => {
       html: `<p>Your OTP is <b>${otp}</b>. It expires in ${ttlMins} minutes.</p>`,
     });
 
-    // audit
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        SELECT $1, document_id, $2, 'otp_request' FROM shares WHERE share_id=$1`,
@@ -341,7 +355,6 @@ router.post("/:share_id/otp/verify", async (req, res) => {
       f.rows[0].otp_id,
     ]);
 
-    // audit
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        SELECT $1, document_id, $2, 'otp_verify' FROM shares WHERE share_id=$1`,
@@ -356,13 +369,15 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 });
 
 /* ============================================================
-  NOTIFY RECIPIENT AFTER SHARE (email with link + QR image)
-  POST /otp/notify-share  (auth)
-  body: { share_id }
+  NOTIFY RECIPIENT (email with link + QR)
+  We expose BOTH paths so your existing frontend call works:
+    - POST /shares/notify-share
+    - POST /shares/otp/notify-share  (alias)
+  body: { share_id, to_email? (override), meta? { document_name?, access?, sender_email?, frontend_link?, qr_image? } }
 ============================================================ */
-router.post("/notify-share", auth, async (req, res) => {
+async function notifyShareHandler(req, res) {
   try {
-    const { share_id } = req.body || {};
+    const { share_id, to_email = null, meta = {} } = req.body || {};
     if (!share_id) return res.status(400).json({ error: "share_id required" });
 
     const q = `
@@ -389,29 +404,31 @@ router.post("/notify-share", auth, async (req, res) => {
       return res.status(403).json({ error: "Share expired" });
     }
 
-    const recipient = sh.to_email_resolved || sh.to_user_email;
-    if (!recipient) return res.status(400).json({ error: "No recipient email" });
+    const recipient = to_email || sh.to_email_resolved || sh.to_user_email;
+    if (!recipient) return res.status(400).json({ error: "No recipient email on this share" });
 
     const openUrl = buildShareUrl(sh.share_id);
     const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
 
+    const subject =
+      sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
+
     await mailer.sendMail({
       from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
       to: recipient,
-      subject: sh.access === "private"
-        ? "A private document was shared with you"
-        : "A public document was shared with you",
+      subject,
       html: `
         <p><b>${sh.from_full_name}</b> (${sh.from_email}) shared a document with you.</p>
-        <p><b>File:</b> ${sh.file_name} (${sh.mime_type || "file"})</p>
-        <p><b>Size:</b> ${Number(sh.file_size_bytes || 0).toLocaleString()} bytes</p>
+        <p><b>File:</b> ${meta.document_name || sh.file_name} (${sh.mime_type || "file"})</p>
+        <p><b>Access:</b> ${(meta.access || sh.access || "").toUpperCase()}</p>
+        <p><b>Sender:</b> ${meta.sender_email || sh.from_email}</p>
         ${sh.expiry_time ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>` : ""}
-        <p>Open link: <a href="${openUrl}">${openUrl}</a></p>
-        <p><img src="${qrImg}" alt="QR code to open the share" /></p>
+        <p>Open link: <a href="${meta.frontend_link || openUrl}">${meta.frontend_link || openUrl}</a></p>
+        <p><img src="${meta.qr_image || qrImg}" alt="QR code to open the share" /></p>
         <p>${
           sh.access === "private"
-          ? `This is <b>PRIVATE</b>. Use your registered email; you'll get an OTP to view & download.`
-          : `This is <b>PUBLIC (view-only)</b>.`
+            ? `This is <b>PRIVATE</b>. Use your registered email; you'll get an OTP to view & download.`
+            : `This is <b>PUBLIC (view-only)</b>.`
         }</p>
       `,
     });
@@ -421,6 +438,11 @@ router.post("/notify-share", auth, async (req, res) => {
     console.error("NOTIFY_SHARE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
-});
+}
+
+// primary path
+router.post("/notify-share", auth, notifyShareHandler);
+// alias to match existing frontend (/shares/otp/notify-share)
+router.post("/otp/notify-share", auth, notifyShareHandler);
 
 export default router;
