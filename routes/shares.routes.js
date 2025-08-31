@@ -3,6 +3,9 @@ import { Router } from "express";
 import dayjs from "dayjs";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
+import { mailer } from "../utils/mailer.js"; // <— add this
+
+
 
 const router = Router();
 
