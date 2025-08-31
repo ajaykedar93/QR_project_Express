@@ -7,7 +7,7 @@ import morgan from "morgan";
 import path from "path";
 import { fileURLToPath } from "url";
 
-// DB pool (ensures process exits if DB is misconfigured)
+// DB (fail fast if misconfigured)
 import { pool } from "./db/db.js";
 
 // Routers
@@ -16,30 +16,40 @@ import documentsRouter from "./routes/documents.routes.js";
 import sharesRouter from "./routes/shares.routes.js";
 import otpRouter from "./routes/otp.routes.js";
 
-// ---- Setup base app ----
+// ---------- App / Paths ----------
 const app = express();
-app.set("trust proxy", 1); // Render/Proxies
+app.set("trust proxy", 1);
 
-// Resolve __dirname for ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---- Config / CORS ----
-const APP_URL = process.env.PUBLIC_APP_URL || "http://localhost:5173"; // Vercel (prod) or Vite (dev)
-const API_URL = process.env.PUBLIC_API_URL || ""; // optional, if you expose API to browser
-const DEV_ORIGIN = "http://localhost:5173";       // Vite default dev server
+// ---------- Env / URLs ----------
+const PORT = Number(process.env.PORT || 5000);
 
-// Build allowed origins
+// FRONTEND URL where users open QR links (used by share emails/QRs)
+const APP_URL =
+  (process.env.PUBLIC_APP_URL && process.env.PUBLIC_APP_URL.replace(/\/$/, "")) ||
+  "http://localhost:5173";
+
+// Optional public API base if you expose it to the browser
+const API_URL =
+  (process.env.PUBLIC_API_URL && process.env.PUBLIC_API_URL.replace(/\/$/, "")) ||
+  `http://localhost:${PORT}`;
+
+// Local dev origin (Vite)
+const DEV_ORIGIN = "http://localhost:5173";
+
+// ---------- CORS ----------
 const allowlist = new Set(
   [APP_URL, API_URL, DEV_ORIGIN]
     .filter(Boolean)
-    .map((u) => u.replace(/\/$/, "")) // trim trailing slash
+    .map((u) => u.replace(/\/$/, ""))
 );
 
 app.use(
   cors({
     origin(origin, cb) {
-      // allow non-browser clients (e.g., curl, server-to-server)
+      // Allow non-browser clients and same-origin
       if (!origin) return cb(null, true);
       const clean = origin.replace(/\/$/, "");
       return allowlist.has(clean) ? cb(null, true) : cb(new Error("CORS: Not allowed"));
@@ -49,25 +59,26 @@ app.use(
   })
 );
 
-// ---- Security / logging ----
+// ---------- Security / Logging ----------
 app.use(
   helmet({
-    crossOriginResourcePolicy: { policy: "cross-origin" }, // allow serving files to other origins
+    crossOriginResourcePolicy: { policy: "cross-origin" }, // allow file preview from other origins
   })
 );
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// ---- Parsers ----
+// ---------- Body parsing ----------
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-// ---- Health checks ----
+// ---------- Health ----------
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "doc-share-api",
     time: new Date().toISOString(),
     app_url: APP_URL,
+    api_url: API_URL,
   });
 });
 
@@ -81,43 +92,41 @@ app.get("/healthz", async (_req, res) => {
   }
 });
 
-// ---- Static files (uploads) ----
-// If you're temporarily storing files on disk (for dev). In prod, prefer Supabase Storage/S3.
+// ---------- Static (uploads) ----------
 const uploadsDir = path.join(process.cwd(), "uploads");
 app.use("/uploads", express.static(uploadsDir, { fallthrough: true }));
 
-// ---- Mount routes ----
+// ---------- Routes ----------
 app.use("/auth", authRouter);
 app.use("/documents", documentsRouter);
 app.use("/shares", sharesRouter);
 app.use("/otp", otpRouter);
 
-// ---- 404 handler ----
+// ---------- 404 ----------
 app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// ---- Error handler ----
+// ---------- Error handler ----------
 app.use((err, req, res, _next) => {
   console.error("UNCAUGHT_ERROR:", err?.message || err);
   const status = err?.status || 500;
   res.status(status).json({ error: err?.message || "Server error" });
 });
 
-// ---- Start server (Render sets PORT) ----
-const PORT = Number(process.env.PORT || 8080);
+// ---------- Start ----------
 app.listen(PORT, async () => {
-  // Probe DB on start to fail fast if misconfigured
   try {
     await pool.query("SELECT 1");
-    console.log(`✅ DB connected`);
+    console.log("✅ DB connected");
   } catch (e) {
     console.error("❌ DB connection failed:", e.message);
   }
 
-  console.log(`🚀 API listening on port ${PORT}`);
-  console.log(`   CORS allowlist: ${Array.from(allowlist).join(", ") || "(none)"}`);
+  console.log(`🚀 API listening on http://localhost:${PORT}`);
   console.log(`   Frontend URL (PUBLIC_APP_URL): ${APP_URL}`);
+  console.log(`   Public API URL (PUBLIC_API_URL): ${API_URL}`);
+  console.log(`   CORS allowlist: ${Array.from(allowlist).join(", ") || "(none)"}`);
 });
 
 export default app;
