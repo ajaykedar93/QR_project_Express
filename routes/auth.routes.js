@@ -2,13 +2,13 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
+import { auth } from "../middleware/auth.js";
 
 const router = Router();
 
-/**
- * Helpers
- */
+/* ----------------------------- Helpers ----------------------------- */
 function normalizeStr(v) {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -16,16 +16,29 @@ function mustEnv(name, fallback) {
   const val = process.env[name];
   return val && val.length ? val : (fallback ?? "");
 }
+function validEmail(email) {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
+}
 
+/* ----------------------------- Rate limits ----------------------------- */
+// Adjust windows/limits as needed
+const loginLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 50,                  // 50 attempts per window per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const existsLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 120,                // to reduce email enumeration abuse
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+/* ----------------------------- POST /auth/register ----------------------------- */
 /**
- * POST /auth/register
  * body: { full_name, email, password }
- * success: 201 { user_id, full_name, email, is_verified, created_at }
- *
- * Notes:
- * - users.email is CITEXT (case-insensitive) in DB; simple equality works.
- * - A DB trigger already links pending shares (to_user_email -> to_user_id) on user insert.
- *   We also keep a backfill UPDATE here as a safety net (idempotent).
+ * 201 -> { user_id, full_name, email, is_verified, created_at }
  */
 router.post("/register", async (req, res) => {
   const client = await pool.connect();
@@ -33,17 +46,22 @@ router.post("/register", async (req, res) => {
     let { full_name, email, password } = req.body || {};
     full_name = normalizeStr(full_name);
     email = normalizeStr(email);
+    const pwd = String(password ?? "");
 
-    if (!full_name || !email || !password) {
+    if (!full_name || !email || !pwd) {
       return res.status(400).json({ error: "Missing full_name, email or password" });
     }
+    if (!validEmail(email)) {
+      return res.status(400).json({ error: "Invalid email" });
+    }
+    if (pwd.trim().length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
 
-    // Hash password
-    const password_hash = await bcrypt.hash(String(password), 10);
+    const password_hash = await bcrypt.hash(pwd, 10);
 
     await client.query("BEGIN");
 
-    // Insert user (CITEXT handles case-insensitive uniqueness)
     const insertSql = `
       INSERT INTO users (full_name, email, password_hash)
       VALUES ($1, $2, $3)
@@ -52,7 +70,7 @@ router.post("/register", async (req, res) => {
     const { rows } = await client.query(insertSql, [full_name, email, password_hash]);
     const newUser = rows[0];
 
-    // Safety net: backfill any pending shares (trigger should do this already)
+    // Safety backfill: link pending shares for this email (trigger already does this)
     await client.query(
       `
         UPDATE shares
@@ -65,12 +83,11 @@ router.post("/register", async (req, res) => {
     );
 
     await client.query("COMMIT");
-
     return res.status(201).json(newUser);
   } catch (e) {
     await client.query("ROLLBACK");
-    // Unique violation (email already exists)
     if (e?.code === "23505") {
+      // unique_violation on users(email)
       return res.status(409).json({ error: "Email already registered" });
     }
     console.error("REGISTER_ERROR:", e);
@@ -80,20 +97,21 @@ router.post("/register", async (req, res) => {
   }
 });
 
+/* ----------------------------- POST /auth/login ----------------------------- */
 /**
- * POST /auth/login
  * body: { email, password }
- * success: 200 { token, user:{ user_id, full_name, email, is_verified, created_at } }
+ * 200 -> { token, user:{ user_id, full_name, email, is_verified, created_at } }
  */
-router.post("/login", async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   try {
     let { email, password } = req.body || {};
     email = normalizeStr(email);
-    if (!email || !password) {
+    const pwd = String(password ?? "");
+
+    if (!email || !pwd.trim()) {
       return res.status(400).json({ error: "Missing email or password" });
     }
-
-    // CITEXT comparison works with '='; no need for LOWER()
+    // With CITEXT we can use '=' directly
     const q = `
       SELECT user_id, full_name, email, password_hash, is_verified, created_at
       FROM users
@@ -104,14 +122,13 @@ router.post("/login", async (req, res) => {
     const user = rows[0];
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    const ok = await bcrypt.compare(String(password), user.password_hash);
+    const ok = await bcrypt.compare(pwd, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
     const secret = mustEnv("JWT_SECRET", "dev-secret");
     if (secret === "dev-secret") {
       console.warn("⚠️ JWT_SECRET is not set. Using a development fallback.");
     }
-
     const token = jwt.sign(
       { user_id: user.user_id, email: user.email },
       secret,
@@ -134,24 +151,43 @@ router.post("/login", async (req, res) => {
   }
 });
 
+/* ----------------------------- GET /auth/exists ----------------------------- */
 /**
- * GET /auth/exists?email=...
- * success: 200 { exists: boolean }
+ * query: ?email=...
+ * 200 -> { exists: boolean }
  */
-router.get("/exists", async (req, res) => {
+router.get("/exists", existsLimiter, async (req, res) => {
   try {
     const email = normalizeStr(req.query.email || "");
     if (!email) return res.json({ exists: false });
 
-    // CITEXT = case-insensitive, so '=' is enough
-    const r = await pool.query(
-      `SELECT 1 FROM users WHERE email = $1 LIMIT 1`,
-      [email]
-    );
-
+    // CITEXT '=' is case-insensitive
+    const r = await pool.query(`SELECT 1 FROM users WHERE email = $1 LIMIT 1`, [email]);
     res.json({ exists: r.rowCount > 0 });
   } catch (err) {
     console.error("USER_EXISTS_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ----------------------------- GET /auth/me ----------------------------- */
+/**
+ * header: Authorization: Bearer <token>
+ * 200 -> { user_id, full_name, email, is_verified, created_at }
+ */
+router.get("/me", auth, async (req, res) => {
+  try {
+    const q = `
+      SELECT user_id, full_name, email, is_verified, created_at
+      FROM users
+      WHERE user_id = $1
+      LIMIT 1
+    `;
+    const { rows } = await pool.query(q, [req.user.user_id]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error("ME_ERROR:", e);
     res.status(500).json({ error: "Server error" });
   }
 });
