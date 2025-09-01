@@ -25,12 +25,31 @@ const upload = multer({ storage });
 
 /** Utility: inline vs attachment */
 function contentDispositionInline(fileName) {
-  const safe = fileName.replace(/"/g, "'");
-  return `inline; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+  const safe = (fileName || "file").replace(/"/g, "'");
+  return `inline; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
 }
 function contentDispositionAttachment(fileName) {
-  const safe = fileName.replace(/"/g, "'");
-  return `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+  const safe = (fileName || "file").replace(/"/g, "'");
+  return `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
+}
+
+/** Resolve viewer_user_id for logs if possible */
+async function resolveViewerUserId(req, share) {
+  // Prefer auth user
+  if (req.user?.user_id) return req.user.user_id;
+
+  // For private flow we use x-user-email header
+  const email = String(req.headers["x-user-email"] || "").trim().toLowerCase();
+  if (!email) return null;
+  const r = await pool.query(
+    `SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
+    [email]
+  );
+  if (!r.rowCount) return null;
+
+  // If share has intended user, ensure they match
+  if (share?.to_user_id && String(share.to_user_id) !== String(r.rows[0].user_id)) return null;
+  return r.rows[0].user_id;
 }
 
 /** Shared access gate: returns { ok, reason, doc, share } */
@@ -43,7 +62,7 @@ async function checkAccess({ document_id, req, forDownload }) {
     );
     if (own.rowCount) {
       const doc = own.rows[0];
-      if (doc.is_owner) return { ok: true, doc };
+      if (doc.is_owner) return { ok: true, doc, share: null };
     }
   }
 
@@ -54,7 +73,7 @@ async function checkAccess({ document_id, req, forDownload }) {
   let share = null;
   if (shareId) {
     const q = `
-      SELECT s.*, d.file_name, d.mime_type, d.file_path, d.file_size_bytes
+      SELECT s.*, d.file_name, d.mime_type, d.file_path, d.file_size_bytes, d.document_id
       FROM shares s
       JOIN documents d ON d.document_id = s.document_id
       WHERE s.share_id=$1
@@ -65,7 +84,7 @@ async function checkAccess({ document_id, req, forDownload }) {
     share = r.rows[0];
   } else if (token) {
     const q = `
-      SELECT s.*, d.file_name, d.mime_type, d.file_path, d.file_size_bytes
+      SELECT s.*, d.file_name, d.mime_type, d.file_path, d.file_size_bytes, d.document_id
       FROM shares s
       JOIN documents d ON d.document_id = s.document_id
       WHERE s.share_token=$1 AND s.document_id=$2
@@ -92,15 +111,14 @@ async function checkAccess({ document_id, req, forDownload }) {
   // public share → allow view, block download
   if (share.access === "public") {
     if (forDownload) return { ok: false, reason: "Public share cannot be downloaded" };
-    return { ok: true, doc: share, share }; // share has d.* columns
+    return { ok: true, doc: share, share };
   }
 
-  // private share → require verified email (ShareAccess page stores in header)
+  // private share → require verified email header (sent after OTP verify)
   if (share.access === "private") {
     const email = String(req.headers["x-user-email"] || "").trim().toLowerCase();
     if (!email) return { ok: false, reason: "Missing verified email" };
 
-    // The email must be registered
     const u = await pool.query(`SELECT user_id, email FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]);
     if (!u.rowCount) return { ok: false, reason: "Email not registered" };
     const userId = u.rows[0].user_id;
@@ -151,9 +169,32 @@ router.get("/", auth, async (req, res) => {
 });
 
 /* ============================================================
+  GET DOCUMENT META (used by frontend viewer)  // NEW
+  GET /documents/:document_id
+  - Public share or owner or private with OTP header → returns basic meta
+============================================================ */
+router.get("/:document_id", async (req, res) => {
+  try {
+    const { document_id } = req.params;
+    const gate = await checkAccess({ document_id, req, forDownload: false });
+    if (!gate.ok) return res.status(403).json({ error: gate.reason || "Not allowed" });
+
+    const meta = {
+      document_id: document_id,
+      file_name: gate.doc.file_name,
+      mime_type: gate.doc.mime_type,
+      file_size_bytes: gate.doc.file_size_bytes,
+    };
+    res.json(meta);
+  } catch (err) {
+    console.error("DOC_META_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ============================================================
   UPLOAD DOCUMENT
   POST /documents/upload  (auth, multipart/form-data)
-  field: file
 ============================================================ */
 router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
@@ -167,7 +208,7 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
     const { rows } = await pool.query(ins, [
       req.user.user_id,
       req.file.originalname,
-      req.file.filename, // we store disk filename; could store full path
+      req.file.filename, // disk filename
       req.file.mimetype || null,
       req.file.size || null,
     ]);
@@ -197,9 +238,7 @@ router.delete("/:document_id", auth, async (req, res) => {
     await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
 
     // Remove file from disk
-    try {
-      fs.unlinkSync(path.join(FILE_ROOT, d.rows[0].file_path));
-    } catch {}
+    try { fs.unlinkSync(path.join(FILE_ROOT, d.rows[0].file_path)); } catch {}
 
     res.json({ success: true });
   } catch (err) {
@@ -209,10 +248,45 @@ router.delete("/:document_id", auth, async (req, res) => {
 });
 
 /* ============================================================
+  INTERNAL: stream helper with Range support  // NEW
+============================================================ */
+function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
+  const stat = fs.statSync(absPath);
+  const fileSize = stat.size;
+
+  res.setHeader("Content-Type", mime);
+  res.setHeader("Content-Disposition", disposition);
+  res.setHeader("Accept-Ranges", "bytes");
+  // Helps embedding (e.g., Office viewer)
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+
+  if (rangeHeader) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+    if (m) {
+      let start = m[1] ? parseInt(m[1], 10) : 0;
+      let end = m[2] ? parseInt(m[2], 10) : fileSize - 1;
+      if (isNaN(start) || isNaN(end) || start > end || end >= fileSize) {
+        start = 0; end = fileSize - 1;
+      }
+      const chunkSize = end - start + 1;
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+      res.setHeader("Content-Length", String(chunkSize));
+      fs.createReadStream(absPath, { start, end }).pipe(res);
+      return;
+    }
+  }
+
+  res.setHeader("Content-Length", String(fileSize));
+  fs.createReadStream(absPath).pipe(res);
+}
+
+/* ============================================================
   VIEW DOCUMENT (public route, guarded by checkAccess)
   GET /documents/view/:document_id
   Query: ?share_id=... or ?token=...
   Header for private: x-user-email: verifiedEmail
+  - Supports Range for better PDF/audio/video preview
 ============================================================ */
 router.get("/view/:document_id", async (req, res) => {
   try {
@@ -224,20 +298,23 @@ router.get("/view/:document_id", async (req, res) => {
     const mime = gate.doc.mime_type || "application/octet-stream";
     const diskName = gate.doc.file_path;
     const abs = path.join(FILE_ROOT, diskName);
-
     if (!fs.existsSync(abs)) return res.status(404).json({ error: "File missing on server" });
 
-    res.setHeader("Content-Type", mime);
-    res.setHeader("Content-Disposition", contentDispositionInline(fileName));
-    // Let browser stream it
-    const stream = fs.createReadStream(abs);
-    stream.pipe(res);
+    // Range-friendly streaming
+    streamFileWithRange(
+      res,
+      abs,
+      mime,
+      contentDispositionInline(fileName),
+      req.headers.range
+    );
 
     // audit
+    const viewerId = await resolveViewerUserId(req, gate.share);
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
-       VALUES ($1, $2, NULL, 'view')`,
-      [gate.share?.share_id || null, gate.doc.document_id]
+       VALUES ($1, $2, $3, 'view')`,
+      [gate.share?.share_id || null, gate.doc.document_id, viewerId]
     );
   } catch (err) {
     console.error("DOC_VIEW_ERROR:", err);
@@ -251,6 +328,7 @@ router.get("/view/:document_id", async (req, res) => {
   - Public shares: blocked
   - Private shares: allowed after OTP verify
   - Owner (auth): allowed
+  - Supports Range too (some browsers use it for big files)
 ============================================================ */
 router.get("/download/:document_id", async (req, res) => {
   try {
@@ -262,19 +340,22 @@ router.get("/download/:document_id", async (req, res) => {
     const mime = gate.doc.mime_type || "application/octet-stream";
     const diskName = gate.doc.file_path;
     const abs = path.join(FILE_ROOT, diskName);
-
     if (!fs.existsSync(abs)) return res.status(404).json({ error: "File missing on server" });
 
-    res.setHeader("Content-Type", mime);
-    res.setHeader("Content-Disposition", contentDispositionAttachment(fileName));
-    const stream = fs.createReadStream(abs);
-    stream.pipe(res);
+    streamFileWithRange(
+      res,
+      abs,
+      mime,
+      contentDispositionAttachment(fileName),
+      req.headers.range
+    );
 
     // audit
+    const viewerId = await resolveViewerUserId(req, gate.share);
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
-       VALUES ($1, $2, NULL, 'download')`,
-      [gate.share?.share_id || null, gate.doc.document_id]
+       VALUES ($1, $2, $3, 'download')`,
+      [gate.share?.share_id || null, gate.doc.document_id, viewerId]
     );
   } catch (err) {
     console.error("DOC_DOWNLOAD_ERROR:", err);
@@ -283,9 +364,8 @@ router.get("/download/:document_id", async (req, res) => {
 });
 
 /* ============================================================
-  (Optional) Resolve by token (used by ViewDoc if you pass token)
-  GET /shares/resolve?token=...&doc=...
-  -> { access, document_id }
+  Resolve by token (optional helper your frontend used elsewhere)
+  GET /documents/resolve-share?token=...&doc=...
 ============================================================ */
 router.get("/resolve-share", async (req, res) => {
   try {
