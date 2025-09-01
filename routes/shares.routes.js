@@ -241,9 +241,132 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
       [share_id, req.user.user_id]
     );
     if (!upd.rowCount) return res.status(404).json({ error: "Share not found" });
+
+    // log
+    await pool.query(
+      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
+       SELECT $1, document_id, $2, 'share_revoke' FROM shares WHERE share_id=$1`,
+      [share_id, req.user.user_id]
+    );
+
     res.json(upd.rows[0]);
   } catch (err) {
     console.error("SHARE_REVOKE_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ============================================================
+  DELETE (owner)  <-- NEW
+  DELETE /shares/:share_id  (auth)
+  Hard delete the share & related pending OTPs
+============================================================ */
+router.delete("/:share_id", auth, async (req, res) => {
+  try {
+    const { share_id } = req.params;
+
+    // authorize & get document id for logging
+    const sel = await pool.query(
+      `SELECT document_id FROM shares WHERE share_id=$1 AND from_user_id=$2 LIMIT 1`,
+      [share_id, req.user.user_id]
+    );
+    if (!sel.rowCount) return res.status(404).json({ error: "Share not found" });
+
+    const docId = sel.rows[0].document_id;
+
+    // delete pending OTPs (keep history table small)
+    await pool.query(`DELETE FROM otp_verifications WHERE share_id=$1 AND is_verified=FALSE`, [share_id]);
+
+    // remove share
+    const del = await pool.query(`DELETE FROM shares WHERE share_id=$1 AND from_user_id=$2`, [share_id, req.user.user_id]);
+    if (!del.rowCount) return res.status(404).json({ error: "Share not found" });
+
+    // log
+    await pool.query(
+      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
+       VALUES ($1, $2, $3, 'share_delete')`,
+      [share_id, docId, req.user.user_id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("SHARE_DELETE_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ============================================================
+  UPDATE EXPIRY (owner)  <-- NEW
+  PATCH /shares/:share_id/expiry  (auth)
+  body: { expiry_time: ISO string | null }  // null removes expiry
+============================================================ */
+router.patch("/:share_id/expiry", auth, async (req, res) => {
+  try {
+    const { share_id } = req.params;
+    let { expiry_time } = req.body || {};
+
+    if (expiry_time !== null && expiry_time !== undefined) {
+      if (!isFuture(expiry_time)) {
+        return res.status(400).json({ error: "expiry_time must be in the future (or null to remove)" });
+      }
+    }
+
+    // authorize
+    const sel = await pool.query(
+      `SELECT document_id FROM shares WHERE share_id=$1 AND from_user_id=$2 LIMIT 1`,
+      [share_id, req.user.user_id]
+    );
+    if (!sel.rowCount) return res.status(404).json({ error: "Share not found" });
+
+    // update
+    const upd = await pool.query(
+      `UPDATE shares SET expiry_time=$1 WHERE share_id=$2 RETURNING share_id, expiry_time`,
+      [expiry_time || null, share_id]
+    );
+
+    // log
+    await pool.query(
+      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action, meta)
+       VALUES ($1, $2, $3, 'share_expiry_update', $4)`,
+      [share_id, sel.rows[0].document_id, req.user.user_id, JSON.stringify({ expiry_time: expiry_time || null })]
+    );
+
+    res.json(upd.rows[0]);
+  } catch (err) {
+    console.error("SHARE_EXPIRY_UPDATE_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ============================================================
+  EXPIRE NOW (owner)  <-- NEW
+  POST /shares/:share_id/expire-now  (auth)
+  Sets expiry_time to current timestamp
+============================================================ */
+router.post("/:share_id/expire-now", auth, async (req, res) => {
+  try {
+    const { share_id } = req.params;
+
+    const sel = await pool.query(
+      `SELECT document_id FROM shares WHERE share_id=$1 AND from_user_id=$2 LIMIT 1`,
+      [share_id, req.user.user_id]
+    );
+    if (!sel.rowCount) return res.status(404).json({ error: "Share not found" });
+
+    const upd = await pool.query(
+      `UPDATE shares SET expiry_time = now() WHERE share_id=$1 RETURNING share_id, expiry_time`,
+      [share_id]
+    );
+
+    await pool.query(
+      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
+       VALUES ($1, $2, $3, 'share_expired_now')`,
+      [share_id, sel.rows[0].document_id, req.user.user_id]
+    );
+
+    res.json(upd.rows[0]);
+  } catch (err) {
+    console.error("SHARE_EXPIRE_NOW_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -370,7 +493,7 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 
 /* ============================================================
   NOTIFY RECIPIENT (email with link + QR)
-  We expose BOTH paths so your existing frontend call works:
+  Paths:
     - POST /shares/notify-share
     - POST /shares/otp/notify-share  (alias)
   body: { share_id, to_email? (override), meta? { document_name?, access?, sender_email?, frontend_link?, qr_image? } }
@@ -440,9 +563,8 @@ async function notifyShareHandler(req, res) {
   }
 }
 
-// primary path
+// primary + alias
 router.post("/notify-share", auth, notifyShareHandler);
-// alias to match existing frontend (/shares/otp/notify-share)
 router.post("/otp/notify-share", auth, notifyShareHandler);
 
 export default router;
