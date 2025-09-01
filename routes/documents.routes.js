@@ -12,7 +12,51 @@ const FILE_ROOT = process.env.FILE_ROOT || path.resolve("uploads");
 // Ensure local folder exists
 fs.mkdirSync(FILE_ROOT, { recursive: true });
 
-// Multer storage (local disk). In production, swap to S3/GCS.
+/* -----------------------------
+   File-type allow/deny lists
+------------------------------*/
+const ALLOWED_EXT = new Set([
+  // docs
+  "pdf", "txt", "md",
+  // office
+  "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv",
+  // images
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg",
+  // media
+  "mp3", "wav", "ogg", "mp4", "webm", "mov", "m4a",
+  // data/text
+  "json", "xml", "yaml", "yml", "log",
+  // archives (preview fallback only)
+  "zip", "rar", "7z", "tar", "gz",
+]);
+
+const BLOCKED_EXT = new Set([
+  "exe", "msi", "bat", "cmd", "sh", "ps1", "php", "jsp", "asp", "dll", "so",
+]);
+
+const OFFICE_RE = /(msword|officedocument|excel|powerpoint)/i;
+const isPdfMime    = (m) => /^application\/pdf$/i.test(m || "");
+const isImgMime    = (m) => /^image\//i.test(m || "");
+const isAudioMime  = (m) => /^audio\//i.test(m || "");
+const isVideoMime  = (m) => /^video\//i.test(m || "");
+const isTextMime   = (m) => /^text\//i.test(m || "") || /(json|xml|yaml)/i.test(m || "");
+const isOfficeMime = (m) => OFFICE_RE.test(m || "");
+
+/** Decide preview strategy (derived at runtime, not stored in DB) */
+function decidePreviewStrategy({ mime = "", file_name = "" }) {
+  const ext = (path.extname(file_name || "").slice(1) || "").toLowerCase();
+  if (isPdfMime(mime) || ext === "pdf") return "pdf";
+  if (isImgMime(mime)) return "image";
+  if (isTextMime(mime) || ["txt", "md", "json", "xml", "yaml", "yml", "csv", "log"].includes(ext)) return "text";
+  if (isAudioMime(mime)) return "audio";
+  if (isVideoMime(mime)) return "video";
+  if (isOfficeMime(mime) || ["doc", "docx", "ppt", "pptx", "xls", "xlsx"].includes(ext)) return "office";
+  return "other"; // fallback
+}
+
+/* -----------------------------
+   Multer storage (local disk)
+------------------------------*/
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, FILE_ROOT),
   filename: (req, file, cb) => {
@@ -21,24 +65,36 @@ const storage = multer.diskStorage({
     cb(null, name);
   },
 });
-const upload = multer({ storage });
 
-/** Utility: inline vs attachment */
-function contentDispositionInline(fileName) {
+// 20 MB default limit (tune as needed)
+const upload = multer({
+  storage,
+  limits: { fileSize: Number(process.env.MAX_UPLOAD_BYTES || 20 * 1024 * 1024) },
+  fileFilter: (req, file, cb) => {
+    const ext = (path.extname(file.originalname || "").slice(1) || "").toLowerCase();
+    if (BLOCKED_EXT.has(ext)) return cb(new Error("Blocked file type"));
+    if (!ALLOWED_EXT.has(ext)) return cb(new Error("Unsupported file type"));
+    cb(null, true);
+  },
+});
+
+/* -----------------------------
+   Content-Disposition helpers
+------------------------------*/
+function cdInline(fileName) {
   const safe = (fileName || "file").replace(/"/g, "'");
   return `inline; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
 }
-function contentDispositionAttachment(fileName) {
+function cdAttachment(fileName) {
   const safe = (fileName || "file").replace(/"/g, "'");
   return `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
 }
 
-/** Resolve viewer_user_id for logs if possible */
+/* -----------------------------
+   Resolve viewer_user_id (logs)
+------------------------------*/
 async function resolveViewerUserId(req, share) {
-  // Prefer auth user
   if (req.user?.user_id) return req.user.user_id;
-
-  // For private flow we use x-user-email header
   const email = String(req.headers["x-user-email"] || "").trim().toLowerCase();
   if (!email) return null;
   const r = await pool.query(
@@ -46,15 +102,15 @@ async function resolveViewerUserId(req, share) {
     [email]
   );
   if (!r.rowCount) return null;
-
-  // If share has intended user, ensure they match
   if (share?.to_user_id && String(share.to_user_id) !== String(r.rows[0].user_id)) return null;
   return r.rows[0].user_id;
 }
 
-/** Shared access gate: returns { ok, reason, doc, share } */
+/* -----------------------------
+   Access gate
+------------------------------*/
 async function checkAccess({ document_id, req, forDownload }) {
-  // Owner can always view/download when authenticated
+  // Owner (authed) can always view/download
   if (req.user?.user_id) {
     const own = await pool.query(
       `SELECT d.*, (d.owner_user_id = $2) AS is_owner FROM documents d WHERE d.document_id=$1 LIMIT 1`,
@@ -97,7 +153,6 @@ async function checkAccess({ document_id, req, forDownload }) {
     // no share param, no owner
     const d = await pool.query(`SELECT * FROM documents WHERE document_id=$1 LIMIT 1`, [document_id]);
     if (!d.rowCount) return { ok: false, reason: "Document not found" };
-    // If document is public at document-level AND not download
     if (d.rows[0].is_public && !forDownload) return { ok: true, doc: d.rows[0], share: null };
     return { ok: false, reason: "Not allowed" };
   }
@@ -114,7 +169,7 @@ async function checkAccess({ document_id, req, forDownload }) {
     return { ok: true, doc: share, share };
   }
 
-  // private share → require verified email header (sent after OTP verify)
+  // private share → require verified email header (after OTP)
   if (share.access === "private") {
     const email = String(req.headers["x-user-email"] || "").trim().toLowerCase();
     if (!email) return { ok: false, reason: "Missing verified email" };
@@ -123,7 +178,6 @@ async function checkAccess({ document_id, req, forDownload }) {
     if (!u.rowCount) return { ok: false, reason: "Email not registered" };
     const userId = u.rows[0].user_id;
 
-    // Must be intended recipient
     if (share.to_user_id && String(share.to_user_id) !== String(userId)) {
       return { ok: false, reason: "Not the intended recipient" };
     }
@@ -133,7 +187,6 @@ async function checkAccess({ document_id, req, forDownload }) {
       }
     }
 
-    // Must have a recent verified OTP
     const v = await pool.query(
       `SELECT 1 FROM otp_verifications 
        WHERE share_id=$1 AND user_id=$2 AND is_verified=TRUE AND expiry_time > now()
@@ -149,8 +202,8 @@ async function checkAccess({ document_id, req, forDownload }) {
 }
 
 /* ============================================================
-  LIST DOCUMENTS (mine)
-  GET /documents  (auth)
+   LIST DOCUMENTS (mine)
+   GET /documents  (auth)
 ============================================================ */
 router.get("/", auth, async (req, res) => {
   try {
@@ -169,9 +222,9 @@ router.get("/", auth, async (req, res) => {
 });
 
 /* ============================================================
-  GET DOCUMENT META (used by frontend viewer)  // NEW
-  GET /documents/:document_id
-  - Public share or owner or private with OTP header → returns basic meta
+   GET DOCUMENT META (used by frontend viewer)
+   GET /documents/:document_id
+   (public share or owner or private with OTP header)
 ============================================================ */
 router.get("/:document_id", async (req, res) => {
   try {
@@ -179,13 +232,18 @@ router.get("/:document_id", async (req, res) => {
     const gate = await checkAccess({ document_id, req, forDownload: false });
     if (!gate.ok) return res.status(403).json({ error: gate.reason || "Not allowed" });
 
-    const meta = {
-      document_id: document_id,
+    const preview_strategy = decidePreviewStrategy({
+      mime: gate.doc.mime_type,
+      file_name: gate.doc.file_name,
+    });
+
+    res.json({
+      document_id,
       file_name: gate.doc.file_name,
       mime_type: gate.doc.mime_type,
       file_size_bytes: gate.doc.file_size_bytes,
-    };
-    res.json(meta);
+      preview_strategy, // "pdf" | "image" | "text" | "audio" | "video" | "office" | "other"
+    });
   } catch (err) {
     console.error("DOC_META_ERROR:", err);
     res.status(500).json({ error: "Server error" });
@@ -193,12 +251,17 @@ router.get("/:document_id", async (req, res) => {
 });
 
 /* ============================================================
-  UPLOAD DOCUMENT
-  POST /documents/upload  (auth, multipart/form-data)
+   UPLOAD DOCUMENT (validate type)
+   POST /documents/upload  (auth, multipart/form-data)
+   field: file
 ============================================================ */
 router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "file required" });
+
+    const ext = (path.extname(req.file.originalname || "").slice(1) || "").toLowerCase();
+    if (BLOCKED_EXT.has(ext)) return res.status(400).json({ error: "Blocked file type" });
+    if (!ALLOWED_EXT.has(ext)) return res.status(400).json({ error: "Unsupported file type" });
 
     const ins = `
       INSERT INTO documents (owner_user_id, file_name, file_path, mime_type, file_size_bytes)
@@ -212,32 +275,36 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
       req.file.mimetype || null,
       req.file.size || null,
     ]);
-    res.status(201).json(rows[0]);
+
+    // Append preview hint for immediate UI use
+    const saved = rows[0];
+    const preview_strategy = decidePreviewStrategy({
+      mime: saved.mime_type,
+      file_name: saved.file_name,
+    });
+
+    res.status(201).json({ ...saved, preview_strategy });
   } catch (err) {
     console.error("DOC_UPLOAD_ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: err.message || "Server error" });
   }
 });
 
 /* ============================================================
-  DELETE DOCUMENT (owner)
-  DELETE /documents/:document_id  (auth)
+   DELETE DOCUMENT (owner)
+   DELETE /documents/:document_id  (auth)
 ============================================================ */
 router.delete("/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
-
-    // Ensure owner
     const d = await pool.query(
       `SELECT file_path FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
       [document_id, req.user.user_id]
     );
     if (!d.rowCount) return res.status(404).json({ error: "Document not found" });
 
-    // Delete record (cascades shares via FK)
     await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
 
-    // Remove file from disk
     try { fs.unlinkSync(path.join(FILE_ROOT, d.rows[0].file_path)); } catch {}
 
     res.json({ success: true });
@@ -248,7 +315,7 @@ router.delete("/:document_id", auth, async (req, res) => {
 });
 
 /* ============================================================
-  INTERNAL: stream helper with Range support  // NEW
+   Internal: Range-friendly streaming
 ============================================================ */
 function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
   const stat = fs.statSync(absPath);
@@ -257,7 +324,7 @@ function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
   res.setHeader("Content-Type", mime);
   res.setHeader("Content-Disposition", disposition);
   res.setHeader("Accept-Ranges", "bytes");
-  // Helps embedding (e.g., Office viewer)
+  // Enable embedding in Office viewer and iframes
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 
   if (rangeHeader) {
@@ -282,11 +349,10 @@ function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
 }
 
 /* ============================================================
-  VIEW DOCUMENT (public route, guarded by checkAccess)
-  GET /documents/view/:document_id
-  Query: ?share_id=... or ?token=...
-  Header for private: x-user-email: verifiedEmail
-  - Supports Range for better PDF/audio/video preview
+   VIEW DOCUMENT (guarded by access)
+   GET /documents/view/:document_id
+   Query: ?share_id=... or ?token=...
+   Header for private: x-user-email
 ============================================================ */
 router.get("/view/:document_id", async (req, res) => {
   try {
@@ -300,14 +366,7 @@ router.get("/view/:document_id", async (req, res) => {
     const abs = path.join(FILE_ROOT, diskName);
     if (!fs.existsSync(abs)) return res.status(404).json({ error: "File missing on server" });
 
-    // Range-friendly streaming
-    streamFileWithRange(
-      res,
-      abs,
-      mime,
-      contentDispositionInline(fileName),
-      req.headers.range
-    );
+    streamFileWithRange(res, abs, mime, cdInline(fileName), req.headers.range);
 
     // audit
     const viewerId = await resolveViewerUserId(req, gate.share);
@@ -323,12 +382,9 @@ router.get("/view/:document_id", async (req, res) => {
 });
 
 /* ============================================================
-  DOWNLOAD DOCUMENT (public route, guarded by checkAccess)
-  GET /documents/download/:document_id
-  - Public shares: blocked
-  - Private shares: allowed after OTP verify
-  - Owner (auth): allowed
-  - Supports Range too (some browsers use it for big files)
+   DOWNLOAD DOCUMENT (guarded by access)
+   GET /documents/download/:document_id
+   Public shares blocked; Private allowed after OTP; Owner allowed.
 ============================================================ */
 router.get("/download/:document_id", async (req, res) => {
   try {
@@ -342,15 +398,8 @@ router.get("/download/:document_id", async (req, res) => {
     const abs = path.join(FILE_ROOT, diskName);
     if (!fs.existsSync(abs)) return res.status(404).json({ error: "File missing on server" });
 
-    streamFileWithRange(
-      res,
-      abs,
-      mime,
-      contentDispositionAttachment(fileName),
-      req.headers.range
-    );
+    streamFileWithRange(res, abs, mime, cdAttachment(fileName), req.headers.range);
 
-    // audit
     const viewerId = await resolveViewerUserId(req, gate.share);
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
@@ -364,8 +413,8 @@ router.get("/download/:document_id", async (req, res) => {
 });
 
 /* ============================================================
-  Resolve by token (optional helper your frontend used elsewhere)
-  GET /documents/resolve-share?token=...&doc=...
+   Resolve by token (optional helper)
+   GET /documents/resolve-share?token=...&doc=...
 ============================================================ */
 router.get("/resolve-share", async (req, res) => {
   try {
