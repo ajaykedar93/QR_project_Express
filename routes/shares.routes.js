@@ -257,7 +257,7 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
 });
 
 /* ============================================================
-  DELETE (owner)
+  DELETE (owner)  <-- NEW
   DELETE /shares/:share_id  (auth)
   Hard delete the share & related pending OTPs
 ============================================================ */
@@ -296,7 +296,7 @@ router.delete("/:share_id", auth, async (req, res) => {
 });
 
 /* ============================================================
-  UPDATE EXPIRY (owner)
+  UPDATE EXPIRY (owner)  <-- NEW
   PATCH /shares/:share_id/expiry  (auth)
   body: { expiry_time: ISO string | null }  // null removes expiry
 ============================================================ */
@@ -339,7 +339,7 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
 });
 
 /* ============================================================
-  EXPIRE NOW (owner)
+  EXPIRE NOW (owner)  <-- NEW
   POST /shares/:share_id/expire-now  (auth)
   Sets expiry_time to current timestamp
 ============================================================ */
@@ -566,73 +566,5 @@ async function notifyShareHandler(req, res) {
 // primary + alias
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
-
-/* ============================================================
-  NEW: DELETE DOCUMENT (owner)  ← (single new API as requested)
-  DELETE /shares/documents/:document_id  (auth)
-  - Owner can delete their document at any time (even if shared).
-  - Cascades:
-      • Deletes pending OTPs for shares of this document
-      • Logs 'document_delete' against all existing shares
-      • Deletes all shares for this document
-      • Deletes the document row
-  - After this, any existing share links will return 404/403 naturally.
-============================================================ */
-router.delete("/documents/:document_id", auth, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { document_id } = req.params;
-
-    // Ensure ownership
-    const doc = await client.query(
-      `SELECT document_id FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
-      [document_id, req.user.user_id]
-    );
-    if (!doc.rowCount) {
-      return res.status(404).json({ error: "Document not found" });
-    }
-
-    await client.query("BEGIN");
-
-    // Log a document_delete entry for each share
-    await client.query(
-      `INSERT INTO access_logs (share_id, document_id, viewer_user_id, action)
-       SELECT s.share_id, s.document_id, $2, 'document_delete'
-         FROM shares s
-        WHERE s.document_id = $1`,
-      [document_id, req.user.user_id]
-    );
-
-    // Delete pending OTPs tied to shares of this document
-    await client.query(
-      `DELETE FROM otp_verifications
-        WHERE share_id IN (SELECT share_id FROM shares WHERE document_id=$1)
-          AND is_verified = FALSE`,
-      [document_id]
-    );
-
-    // Delete shares of this document
-    await client.query(`DELETE FROM shares WHERE document_id=$1`, [document_id]);
-
-    // Finally delete the document
-    const delDoc = await client.query(
-      `DELETE FROM documents WHERE document_id=$1 AND owner_user_id=$2 RETURNING document_id`,
-      [document_id, req.user.user_id]
-    );
-    if (!delDoc.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ error: "Document not found" });
-    }
-
-    await client.query("COMMIT");
-    return res.json({ success: true });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("DOCUMENT_DELETE_ERROR:", err);
-    return res.status(500).json({ error: "Server error" });
-  } finally {
-    client.release();
-  }
-});
 
 export default router;
