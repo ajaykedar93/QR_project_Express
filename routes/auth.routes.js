@@ -1,10 +1,11 @@
-// routes/auth.routes.js
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
+import nodemailer from "nodemailer";
+import crypto from "crypto";
 
 const router = Router();
 
@@ -12,14 +13,15 @@ const router = Router();
 function normalizeStr(v) {
   return typeof v === "string" ? v.trim() : "";
 }
+
 function mustEnv(name, fallback) {
   const val = process.env[name];
   return val && val.length ? val : (fallback ?? "");
 }
+
 function validEmail(email) {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
 }
-
 
 /* ----------------------------- Rate limits ----------------------------- */
 // Adjust windows/limits as needed
@@ -29,6 +31,7 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
 const existsLimiter = rateLimit({
   windowMs: 5 * 60 * 1000, // 5 minutes
   max: 120,                // to reduce email enumeration abuse
@@ -36,14 +39,12 @@ const existsLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-/* ----------------------------- Rate Limits ----------------------------- */
 const forgotLimiter = rateLimit({
   windowMs: 5 * 60 * 1000, // 5 minutes
-  max: 10, // Max 10 requests per IP per window for password recovery
+  max: 10,                 // Max 10 requests per IP
   standardHeaders: true,
   legacyHeaders: false,
 });
-
 
 // Email OTP
 async function sendOtp(email) {
@@ -150,24 +151,26 @@ router.post("/login", loginLimiter, async (req, res) => {
     if (!email || !pwd.trim()) {
       return res.status(400).json({ error: "Missing email or password" });
     }
-    // With CITEXT we can use '=' directly
-    const q = `
+
+    const query = `
       SELECT user_id, full_name, email, password_hash, is_verified, created_at
       FROM users
       WHERE email = $1
       LIMIT 1
     `;
-    const { rows } = await pool.query(q, [email]);
+    const { rows } = await pool.query(query, [email]);
     const user = rows[0];
-    if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    const ok = await bcrypt.compare(pwd, user.password_hash);
-    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const passwordMatch = await bcrypt.compare(pwd, user.password_hash);
+    if (!passwordMatch) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
 
     const secret = mustEnv("JWT_SECRET", "dev-secret");
-    if (secret === "dev-secret") {
-      console.warn("⚠️ JWT_SECRET is not set. Using a development fallback.");
-    }
     const token = jwt.sign(
       { user_id: user.user_id, email: user.email },
       secret,
@@ -186,54 +189,15 @@ router.post("/login", loginLimiter, async (req, res) => {
     });
   } catch (e) {
     console.error("LOGIN_ERROR:", e);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
-
-/* ----------------------------- GET /auth/exists ----------------------------- */
-/**
- * query: ?email=...
- * 200 -> { exists: boolean }
- */
-router.get("/exists", existsLimiter, async (req, res) => {
-  try {
-    const email = normalizeStr(req.query.email || "");
-    if (!email) return res.json({ exists: false });
-
-    // CITEXT '=' is case-insensitive
-    const r = await pool.query(`SELECT 1 FROM users WHERE email = $1 LIMIT 1`, [email]);
-    res.json({ exists: r.rowCount > 0 });
-  } catch (err) {
-    console.error("USER_EXISTS_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-/* ----------------------------- GET /auth/me ----------------------------- */
+/* ----------------------------- POST /auth/forgot/start ----------------------------- */
 /**
- * header: Authorization: Bearer <token>
- * 200 -> { user_id, full_name, email, is_verified, created_at }
+ * Start OTP process
+ * 200 -> { message: 'OTP sent to your email' }
  */
-router.get("/me", auth, async (req, res) => {
-  try {
-    const q = `
-      SELECT user_id, full_name, email, is_verified, created_at
-      FROM users
-      WHERE user_id = $1
-      LIMIT 1
-    `;
-    const { rows } = await pool.query(q, [req.user.user_id]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json(rows[0]);
-  } catch (e) {
-    console.error("ME_ERROR:", e);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-
-
-// POST /auth/forgot/start - Send OTP to email for password recovery
 router.post("/forgot/start", forgotLimiter, async (req, res) => {
   try {
     const { email } = req.body;
@@ -258,7 +222,11 @@ router.post("/forgot/start", forgotLimiter, async (req, res) => {
   }
 });
 
-// POST /auth/forgot/verify - Verify OTP
+/* ----------------------------- POST /auth/forgot/verify ----------------------------- */
+/**
+ * Verify OTP and generate reset token
+ * 200 -> { reset_token: 'your-reset-token' }
+ */
 router.post("/forgot/verify", async (req, res) => {
   try {
     const { email, otp } = req.body;
@@ -287,7 +255,11 @@ router.post("/forgot/verify", async (req, res) => {
   }
 });
 
-// POST /auth/forgot/reset - Reset password
+/* ----------------------------- POST /auth/forgot/reset ----------------------------- */
+/**
+ * Reset password using reset token
+ * 200 -> { message: 'Password successfully reset' }
+ */
 router.post("/forgot/reset", async (req, res) => {
   try {
     const { reset_token, new_password } = req.body;
