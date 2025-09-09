@@ -20,6 +20,7 @@ function validEmail(email) {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
 }
 
+
 /* ----------------------------- Rate limits ----------------------------- */
 // Adjust windows/limits as needed
 const loginLimiter = rateLimit({
@@ -34,6 +35,44 @@ const existsLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+/* ----------------------------- Rate Limits ----------------------------- */
+const forgotLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 10, // Max 10 requests per IP per window for password recovery
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+
+// Email OTP
+async function sendOtp(email) {
+  const otp = crypto.randomInt(100000, 999999).toString(); // Generate a 6 digit OTP
+  const transporter = nodemailer.createTransport({
+    service: 'gmail', // You can use other services (e.g., SendGrid, Mailgun)
+    auth: {
+      user: process.env.EMAIL_USER, // from .env
+      pass: process.env.EMAIL_PASS, // from .env
+    },
+  });
+
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: email,
+    subject: 'Password Reset OTP',
+    text: `Your OTP for password reset is: ${otp}`,
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    // Store OTP in the database for validation
+    await pool.query("UPDATE users SET otp = $1 WHERE email = $2", [otp, email]);
+    return otp;
+  } catch (error) {
+    console.error("Email send failed:", error);
+    throw new Error("Failed to send OTP");
+  }
+}
 
 /* ----------------------------- POST /auth/register ----------------------------- */
 /**
@@ -189,6 +228,94 @@ router.get("/me", auth, async (req, res) => {
   } catch (e) {
     console.error("ME_ERROR:", e);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+
+// POST /auth/forgot/start - Send OTP to email for password recovery
+router.post("/forgot/start", forgotLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    const normalizedEmail = normalizeStr(email);
+
+    if (!validEmail(normalizedEmail)) {
+      return res.status(400).json({ error: "Invalid email format" });
+    }
+
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [normalizedEmail]);
+    const user = result.rows[0];
+    if (!user) {
+      return res.status(404).json({ error: "Email not found" });
+    }
+
+    // Send OTP to email
+    await sendOtp(normalizedEmail);
+    res.status(200).json({ message: "OTP sent to your email" });
+  } catch (err) {
+    console.error("Forgot Password Start Error:", err);
+    res.status(500).json({ error: "Failed to initiate password reset" });
+  }
+});
+
+// POST /auth/forgot/verify - Verify OTP
+router.post("/forgot/verify", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const normalizedEmail = normalizeStr(email);
+
+    // Validate OTP format
+    if (!otp || otp.length !== 6) {
+      return res.status(400).json({ error: "Invalid OTP format" });
+    }
+
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [normalizedEmail]);
+    const user = result.rows[0];
+    if (!user) return res.status(404).json({ error: "Email not found" });
+
+    // Verify OTP
+    if (user.otp !== otp) {
+      return res.status(400).json({ error: "Invalid OTP" });
+    }
+
+    // Generate reset token
+    const resetToken = jwt.sign({ email: normalizedEmail }, mustEnv("JWT_SECRET", "dev-secret"), { expiresIn: "15m" });
+    res.status(200).json({ reset_token: resetToken });
+  } catch (err) {
+    console.error("Forgot Password Verify Error:", err);
+    res.status(500).json({ error: "Failed to verify OTP" });
+  }
+});
+
+// POST /auth/forgot/reset - Reset password
+router.post("/forgot/reset", async (req, res) => {
+  try {
+    const { reset_token, new_password } = req.body;
+
+    // Validate reset token
+    let decoded;
+    try {
+      decoded = jwt.verify(reset_token, mustEnv("JWT_SECRET", "dev-secret"));
+    } catch (e) {
+      return res.status(400).json({ error: "Invalid or expired reset token" });
+    }
+
+    const email = decoded.email;
+    if (!email) return res.status(400).json({ error: "Missing email in reset token" });
+
+    if (!new_password || new_password.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+
+    const password_hash = await bcrypt.hash(new_password, 10);
+
+    // Update password in DB
+    await pool.query("UPDATE users SET password_hash = $1 WHERE email = $2", [password_hash, email]);
+
+    res.status(200).json({ message: "Password successfully reset" });
+  } catch (err) {
+    console.error("Password Reset Error:", err);
+    res.status(500).json({ error: "Failed to reset password" });
   }
 });
 
