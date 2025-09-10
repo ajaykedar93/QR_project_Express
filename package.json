@@ -16,6 +16,7 @@
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
     "dayjs": "^1.11.14",
+    "execa": "^9.6.0",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.1",
     "helmet": "^8.1.0",
@@ -25,6 +26,7 @@
     "nodemailer": "^7.0.5",
     "pg": "^8.16.3",
     "qrcode": "^1.5.4",
+    "sharp": "^0.34.3",
     "uuid": "^11.1.0"
   },
   "devDependencies": {
