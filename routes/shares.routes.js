@@ -16,9 +16,19 @@ function buildShareUrl(shareId) {
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
 /* ============================================================
+  ONE-TIME MIGRATION (run in your DB)
+  -------------------------------------------------------------
+  CREATE TABLE IF NOT EXISTS share_dismissals (
+    share_id UUID NOT NULL REFERENCES shares(share_id) ON DELETE CASCADE,
+    user_id  UUID NOT NULL REFERENCES users(user_id)  ON DELETE CASCADE,
+    hidden_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (share_id, user_id)
+  );
+============================================================ */
+
+/* ============================================================
   CREATE SHARE
   POST /shares  (auth)
-  body: { document_id, to_email?, expiry_time? (ISO), access? ("private"|"public") }
 ============================================================ */
 router.post("/", auth, async (req, res) => {
   try {
@@ -26,7 +36,7 @@ router.post("/", auth, async (req, res) => {
       document_id,
       to_email = "",
       expiry_time = null,
-      access = null, // optional explicit access
+      access = null,
     } = req.body || {};
 
     document_id = String(document_id || "").trim();
@@ -56,8 +66,7 @@ router.post("/", auth, async (req, res) => {
       if (u.rowCount) to_user_id = u.rows[0].user_id;
     }
 
-    // decide access
-    // if explicit provided, enforce rules; else infer: registered => private, else public
+    // access decision
     let finalAccess;
     if (access === "private") {
       if (!to_email) {
@@ -70,7 +79,6 @@ router.post("/", auth, async (req, res) => {
     } else if (access === "public") {
       finalAccess = "public";
     } else {
-      // legacy implicit behavior
       finalAccess = to_user_id ? "private" : "public";
     }
 
@@ -91,7 +99,6 @@ router.post("/", auth, async (req, res) => {
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error("SHARE_CREATE_ERROR:", err);
-    // unique or trigger errors bubble up as 400
     return res.status(400).json({ error: err?.message || "Cannot create share" });
   }
 });
@@ -122,7 +129,7 @@ router.get("/mine", auth, async (req, res) => {
 });
 
 /* ============================================================
-  RECEIVED SHARES (active)
+  RECEIVED SHARES (active, excluding dismissed)
   GET /shares/received  (auth)
 ============================================================ */
 router.get("/received", auth, async (req, res) => {
@@ -134,9 +141,14 @@ router.get("/received", auth, async (req, res) => {
       FROM shares s
       JOIN documents d ON d.document_id = s.document_id
       JOIN users u ON u.user_id = s.from_user_id
+ LEFT JOIN share_dismissals sd ON sd.share_id = s.share_id AND sd.user_id = $1
       WHERE s.is_revoked = FALSE
         AND (s.expiry_time IS NULL OR s.expiry_time > now())
-        AND (s.to_user_id = $1 OR (s.to_user_id IS NULL AND LOWER(s.to_user_email) = LOWER($2)))
+        AND sd.share_id IS NULL
+        AND (
+             s.to_user_id = $1
+             OR (s.to_user_id IS NULL AND LOWER(s.to_user_email) = LOWER($2))
+        )
       ORDER BY s.created_at DESC
     `;
     const { rows } = await pool.query(q, [req.user.user_id, req.user.email]);
@@ -191,7 +203,6 @@ router.get("/:share_id", auth, async (req, res) => {
 /* ============================================================
   MINIMAL (public)
   GET /shares/:share_id/minimal
-  -> { share_id, document_id, access, to_user_email }
 ============================================================ */
 router.get("/:share_id/minimal", async (req, res) => {
   try {
@@ -242,7 +253,6 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
     );
     if (!upd.rowCount) return res.status(404).json({ error: "Share not found" });
 
-    // log
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        SELECT $1, document_id, $2, 'share_revoke' FROM shares WHERE share_id=$1`,
@@ -257,15 +267,13 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
 });
 
 /* ============================================================
-  DELETE (owner)  <-- NEW
+  DELETE (owner) – already in your file
   DELETE /shares/:share_id  (auth)
-  Hard delete the share & related pending OTPs
 ============================================================ */
 router.delete("/:share_id", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
 
-    // authorize & get document id for logging
     const sel = await pool.query(
       `SELECT document_id FROM shares WHERE share_id=$1 AND from_user_id=$2 LIMIT 1`,
       [share_id, req.user.user_id]
@@ -274,14 +282,11 @@ router.delete("/:share_id", auth, async (req, res) => {
 
     const docId = sel.rows[0].document_id;
 
-    // delete pending OTPs (keep history table small)
     await pool.query(`DELETE FROM otp_verifications WHERE share_id=$1 AND is_verified=FALSE`, [share_id]);
 
-    // remove share
     const del = await pool.query(`DELETE FROM shares WHERE share_id=$1 AND from_user_id=$2`, [share_id, req.user.user_id]);
     if (!del.rowCount) return res.status(404).json({ error: "Share not found" });
 
-    // log
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        VALUES ($1, $2, $3, 'share_delete')`,
@@ -296,9 +301,70 @@ router.delete("/:share_id", auth, async (req, res) => {
 });
 
 /* ============================================================
-  UPDATE EXPIRY (owner)  <-- NEW
+  NEW: Recipient dismiss/hide (does NOT delete the share)
+  POST /shares/:share_id/dismiss   (auth)
+  -> hides from GET /shares/received for that user
+============================================================ */
+router.post("/:share_id/dismiss", auth, async (req, res) => {
+  try {
+    const { share_id } = req.params;
+
+    // ensure the user is a valid recipient of this share
+    const chk = await pool.query(
+      `
+      SELECT 1
+        FROM shares s
+       WHERE s.share_id = $1
+         AND s.is_revoked = FALSE
+         AND (s.expiry_time IS NULL OR s.expiry_time > now())
+         AND (
+              s.to_user_id = $2
+              OR (s.to_user_id IS NULL AND LOWER(s.to_user_email) = LOWER($3))
+         )
+      LIMIT 1
+      `,
+      [share_id, req.user.user_id, req.user.email]
+    );
+    if (!chk.rowCount) return res.status(404).json({ error: "Share not found for this user" });
+
+    await pool.query(
+      `
+      INSERT INTO share_dismissals (share_id, user_id)
+      VALUES ($1, $2)
+      ON CONFLICT (share_id, user_id) DO NOTHING
+      `,
+      [share_id, req.user.user_id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("SHARE_DISMISS_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ============================================================
+  NEW: Undo recipient dismiss
+  DELETE /shares/:share_id/dismiss  (auth)
+============================================================ */
+router.delete("/:share_id/dismiss", auth, async (req, res) => {
+  try {
+    const { share_id } = req.params;
+    const del = await pool.query(
+      `DELETE FROM share_dismissals WHERE share_id=$1 AND user_id=$2`,
+      [share_id, req.user.user_id]
+    );
+    if (!del.rowCount) return res.status(404).json({ error: "Not dismissed" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("SHARE_UNDISMISS_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ============================================================
+  UPDATE EXPIRY (owner)
   PATCH /shares/:share_id/expiry  (auth)
-  body: { expiry_time: ISO string | null }  // null removes expiry
 ============================================================ */
 router.patch("/:share_id/expiry", auth, async (req, res) => {
   try {
@@ -311,20 +377,17 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
       }
     }
 
-    // authorize
     const sel = await pool.query(
       `SELECT document_id FROM shares WHERE share_id=$1 AND from_user_id=$2 LIMIT 1`,
       [share_id, req.user.user_id]
     );
     if (!sel.rowCount) return res.status(404).json({ error: "Share not found" });
 
-    // update
     const upd = await pool.query(
       `UPDATE shares SET expiry_time=$1 WHERE share_id=$2 RETURNING share_id, expiry_time`,
       [expiry_time || null, share_id]
     );
 
-    // log
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action, meta)
        VALUES ($1, $2, $3, 'share_expiry_update', $4)`,
@@ -339,9 +402,8 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
 });
 
 /* ============================================================
-  EXPIRE NOW (owner)  <-- NEW
+  EXPIRE NOW (owner)
   POST /shares/:share_id/expire-now  (auth)
-  Sets expiry_time to current timestamp
 ============================================================ */
 router.post("/:share_id/expire-now", auth, async (req, res) => {
   try {
@@ -374,7 +436,6 @@ router.post("/:share_id/expire-now", auth, async (req, res) => {
 /* ============================================================
   SEND OTP (private)
   POST /shares/:share_id/otp/send
-  body: { email }
 ============================================================ */
 router.post("/:share_id/otp/send", async (req, res) => {
   try {
@@ -399,7 +460,6 @@ router.post("/:share_id/otp/send", async (req, res) => {
     if (!ures.rowCount) return res.status(400).json({ error: "User must register first" });
     const user = ures.rows[0];
 
-    // intended recipient check
     if (sh.to_user_id && String(sh.to_user_id) !== String(user.user_id)) {
       return res.status(403).json({ error: "Not the intended recipient" });
     }
@@ -443,7 +503,6 @@ router.post("/:share_id/otp/send", async (req, res) => {
 /* ============================================================
   VERIFY OTP
   POST /shares/:share_id/otp/verify
-  body: { email, otp }
 ============================================================ */
 router.post("/:share_id/otp/verify", async (req, res) => {
   try {
@@ -493,10 +552,8 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 
 /* ============================================================
   NOTIFY RECIPIENT (email with link + QR)
-  Paths:
-    - POST /shares/notify-share
-    - POST /shares/otp/notify-share  (alias)
-  body: { share_id, to_email? (override), meta? { document_name?, access?, sender_email?, frontend_link?, qr_image? } }
+  POST /shares/notify-share
+  POST /shares/otp/notify-share (alias)
 ============================================================ */
 async function notifyShareHandler(req, res) {
   try {
@@ -563,8 +620,41 @@ async function notifyShareHandler(req, res) {
   }
 }
 
-// primary + alias
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
+
+/* ============================================================
+  NEW: Delete a document (owner) – cascades to shares
+  DELETE /documents/:document_id  (auth)
+============================================================ */
+router.delete("/documents/:document_id", auth, async (req, res) => {
+  try {
+    const { document_id } = req.params;
+
+    // authorize
+    const chk = await pool.query(
+      `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
+      [document_id, req.user.user_id]
+    );
+    if (!chk.rowCount) return res.status(404).json({ error: "Document not found" });
+
+    // (Optional) delete from blob storage here using file_path if you store externally.
+
+    // delete document (shares removed by ON DELETE CASCADE)
+    await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
+
+    // log
+    await pool.query(
+      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
+       VALUES (NULL, $1, $2, 'document_delete')`,
+      [document_id, req.user.user_id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DOCUMENT_DELETE_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 export default router;
