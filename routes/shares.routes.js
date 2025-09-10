@@ -8,7 +8,7 @@ import { mailer } from "../utils/mailer.js";
 const router = Router();
 
 // Frontend URL where recipients open shares
-const APP_URL = "https://qr-project-react-n8xx.vercel.app";
+const APP_URL = "https://qr-project-react.vercel.app/";
 
 function buildShareUrl(shareId) {
   return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareId)}`;
