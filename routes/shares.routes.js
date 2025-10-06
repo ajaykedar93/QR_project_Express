@@ -12,6 +12,7 @@ const APP_URL = "https://qr-project-react.vercel.app/";
 function buildShareUrl(shareId) {
   return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareId)}`;
 }
+
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
 
@@ -495,10 +496,6 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 });
 
 
-// Helper to build share URL
-function buildShareUrl(share_id) {
-  return `https://yourdomain.com/share/${share_id}`;
-}
 
 // Notify share handler
 async function notifyShareHandler(req, res) {
