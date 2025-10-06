@@ -12,7 +12,6 @@ const APP_URL = "https://qr-project-react.vercel.app/";
 function buildShareUrl(shareId) {
   return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareId)}`;
 }
-
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
 
@@ -496,8 +495,6 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 });
 
 
-
-// Notify share handler
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
@@ -534,13 +531,10 @@ async function notifyShareHandler(req, res) {
     const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
 
     const subject =
-      sh.access === "private"
-        ? "A private document was shared with you"
-        : "A public document was shared with you";
+      sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
 
-    // --- Send email via Mailtrap ---
     await mailer.sendMail({
-      from: `"QR-Docs" <${process.env.EMAIL_FROM}>`, // Use verified domain
+      from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
       to: recipient,
       subject,
       html: `
@@ -566,14 +560,13 @@ async function notifyShareHandler(req, res) {
   }
 }
 
-// Routes
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
 
-// Delete document route
 router.delete("/documents/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
+
 
     const chk = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
@@ -581,9 +574,10 @@ router.delete("/documents/:document_id", auth, async (req, res) => {
     );
     if (!chk.rowCount) return res.status(404).json({ error: "Document not found" });
 
+    
     await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
 
-    // Log the deletion
+    // log
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        VALUES (NULL, $1, $2, 'document_delete')`,
@@ -596,6 +590,5 @@ router.delete("/documents/:document_id", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 export default router;
