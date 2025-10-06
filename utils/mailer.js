@@ -1,27 +1,19 @@
-// utils/mailer.js
 import nodemailer from "nodemailer";
-import { MailtrapTransport } from "mailtrap";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-export const mailer = nodemailer.createTransport(
-  MailtrapTransport({
-    token: process.env.MAILTRAP_TOKEN, // 619bfaed6c8fb4bf35412c8728898ba5
-  })
-);
+export const mailer = nodemailer.createTransport({
+  host: "smtp.mailtrap.io", // Use 2525 for testing or 587 for live
+  port: 2525,
+  auth: {
+    user: process.env.MAILTRAP_USER,
+    pass: process.env.MAILTRAP_PASS,
+  },
+});
 
-// Example send function
-export const sendMail = async (to, subject, text) => {
-  try {
-    await mailer.sendMail({
-      from: { address: "hello@demomailtrap.co", name: "Placement Drive" },
-      to,
-      subject,
-      text,
-    });
-    console.log("✅ Email sent successfully!");
-  } catch (err) {
-    console.error("❌ MAILER_ERROR:", err);
-  }
-};
+// Verify connection
+mailer.verify((err, success) => {
+  if (err) console.error("❌ Mailtrap connection failed:", err);
+  else console.log("✅ Mailtrap ready to send emails!");
+});
