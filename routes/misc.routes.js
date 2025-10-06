@@ -4,10 +4,6 @@ import { pool } from "../db/db.js";
 
 const router = Router();
 
-/**
- * GET /auth/exists?email=
- * Used by the frontend to show "Registered ✅" vs "Not registered"
- */
 router.get("/auth/exists", async (req, res) => {
   try {
     const email = String(req.query.email || "").trim();

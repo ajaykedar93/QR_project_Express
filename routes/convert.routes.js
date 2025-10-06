@@ -9,20 +9,20 @@ import sharp from "sharp";
 
 const router = Router();
 
-// --- folders ---
+
 const UPLOADS = path.join(process.cwd(), "uploads");
 const OUTPUTS  = path.join(process.cwd(), "outputs");
 for (const p of [UPLOADS, OUTPUTS]) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
 }
 
-// --- multer: save to disk for CLI tools ---
+
 const upload = multer({
   dest: UPLOADS,
   limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-// --- helpers ---
+
 const isPdf   = (m, n) => /pdf/i.test(m || "") || /\.pdf$/i.test(n || "");
 const isDocx  = (m, n) =>
   /officedocument\.wordprocessingml\.document|msword/i.test(m || "") ||
@@ -42,10 +42,6 @@ function asDownload(res, filePath, downloadName, mime = undefined) {
   return res.download(filePath, downloadName);
 }
 
-/* ============================================================
-   DOCX → PDF (LibreOffice)
-   POST /convert/docx-to-pdf  (multipart 'file')
-============================================================ */
 router.post("/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file required" });
   const inPath = req.file.path;
@@ -57,10 +53,10 @@ router.post("/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
   }
 
   try {
-    // Convert using LibreOffice (needs soffice installed)
+ 
     await execa("soffice", ["--headless", "--convert-to", "pdf", "--outdir", OUTPUTS, inPath]);
 
-    // LibreOffice writes <tmpBase>.pdf; rename to user-friendly name
+   
     const tmpPdf = path.join(OUTPUTS, `${path.parse(inPath).name}.pdf`);
     const outName = safeBase(orig).replace(/\.(docx?|DOCX?)$/, "") + "-converted.pdf";
     const outPath = path.join(OUTPUTS, outName);
@@ -75,11 +71,7 @@ router.post("/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
   }
 });
 
-/* ============================================================
-   PDF → JPG (Poppler)
-   POST /convert/pdf-to-jpg  (multipart 'file')
-   -> { files: ["/file/xxx-1.jpg", ...] }
-============================================================ */
+
 router.post("/convert/pdf-to-jpg", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file required" });
   const inPath = req.file.path;
@@ -92,15 +84,14 @@ router.post("/convert/pdf-to-jpg", upload.single("file"), async (req, res) => {
 
   try {
     const base = path.join(OUTPUTS, safeBase(path.parse(orig).name));
-    // -r DPI: tune 150–300 for clarity/size tradeoff
+   
     await execa("pdftoppm", ["-jpeg", "-r", "150", inPath, base]);
 
-    // Collect generated files: base-1.jpg, base-2.jpg...
     const prefix = path.basename(base);
     const all = (await fsp.readdir(OUTPUTS))
       .filter((f) => f.startsWith(prefix) && /\.jpg$/i.test(f))
       .sort((a, b) => {
-        // ensure numeric ordering by page
+        
         const na = parseInt((a.match(/-(\d+)\.jpg$/i) || [])[1] || "0", 10);
         const nb = parseInt((b.match(/-(\d+)\.jpg$/i) || [])[1] || "0", 10);
         return na - nb;
@@ -116,11 +107,7 @@ router.post("/convert/pdf-to-jpg", upload.single("file"), async (req, res) => {
   }
 });
 
-/* ============================================================
-   Compress PDF (Ghostscript)
-   POST /compress/pdf  (multipart 'file')
-   query: ?preset=screen|ebook|printer|prepress  (default=screen)
-============================================================ */
+
 router.post("/compress/pdf", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file required" });
   const inPath = req.file.path;
@@ -158,11 +145,6 @@ router.post("/compress/pdf", upload.single("file"), async (req, res) => {
   }
 });
 
-/* ============================================================
-   Compress Image (Sharp → JPEG)
-   POST /compress/image  (multipart 'file')
-   query: ?q=75  (1–100), defaults 75
-============================================================ */
 router.post("/compress/image", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file required" });
   const inPath = req.file.path;
@@ -179,7 +161,7 @@ router.post("/compress/image", upload.single("file"), async (req, res) => {
 
   try {
     await sharp(inPath)
-      // Optionally resize here: .resize({ width: 1920, withoutEnlargement: true })
+     
       .jpeg({ quality: q, mozjpeg: true })
       .toFile(outPath);
 

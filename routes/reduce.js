@@ -18,17 +18,17 @@ for (const d of [TEMP_DIR, OUT_DIR]) if (!fs.existsSync(d)) fs.mkdirSync(d, { re
 
 const upload = multer({ dest: TEMP_DIR });
 
-/* ----------------- resolve Ghostscript binary ----------------- */
-let GS_BIN = process.env.GS_BIN || "gs"; // allow override
+
+let GS_BIN = process.env.GS_BIN || "gs"; 
 
 if (process.platform === "win32" && !process.env.GS_BIN) {
-  // Prefer Windows console binary
-  GS_BIN = "gswin64c"; // or gswin32c on 32-bit
+
+  GS_BIN = "gswin64c"; 
 }
 
 async function hasGhostscript() {
   try {
-    await execFileAsync(GS_BIN, ["-v"]); // version prints to stderr; non-zero exit is fine as long as it runs
+    await execFileAsync(GS_BIN, ["-v"]); 
     return true;
   } catch {
     return false;
@@ -45,7 +45,6 @@ let GS_AVAILABLE = false;
   }
 })();
 
-/* ----------------- compression using Ghostscript ----------------- */
 async function compressPdf(input, output, preset = "/ebook") {
   const args = [
     "-sDEVICE=pdfwrite",
@@ -65,16 +64,14 @@ async function compressPdf(input, output, preset = "/ebook") {
     `-sOutputFile=${output}`,
     input,
   ];
-  await execFileAsync(GS_BIN, args); // throws ENOENT if not installed
+  await execFileAsync(GS_BIN, args); 
   if (!fs.existsSync(output)) throw new Error("Ghostscript did not produce output");
 }
 
-/* ----------------- ROUTES ----------------- */
 
-// Upload + reduce PDF (strictly PDFs)
 router.post("/upload", upload.single("file"), async (req, res) => {
   if (!GS_AVAILABLE) {
-    // Clean temp file if present
+
     if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
     return res.status(501).json({
       error: "Ghostscript not available on the server. Install Ghostscript or set GS_BIN.",
@@ -100,13 +97,13 @@ router.post("/upload", upload.single("file"), async (req, res) => {
     const outName = `${Date.now()}-${file.originalname.replace(/[^\w.\-() ]+/g, "_")}`;
     const outPath  = path.join(OUT_DIR, outName);
 
-    // Try /ebook first, then /screen if it didn't reduce meaningfully
+  
     await compressPdf(inputPath, outPath, "/ebook");
     const origSize = file.size;
     let newSize = fs.statSync(outPath).size;
 
     if (newSize >= origSize) {
-      // try more aggressive profile
+     
       await compressPdf(inputPath, outPath, "/screen");
       newSize = fs.statSync(outPath).size;
     }
@@ -149,7 +146,7 @@ router.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Preview
+
 router.get("/:id/preview", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM size_reductions WHERE id=$1", [req.params.id]);
@@ -165,7 +162,7 @@ router.get("/:id/preview", async (req, res) => {
   }
 });
 
-// Download
+
 router.get("/:id/download", async (req, res) => {
   try {
     const { rows } = await pool.query("SELECT * FROM size_reductions WHERE id=$1", [req.params.id]);
@@ -180,7 +177,7 @@ router.get("/:id/download", async (req, res) => {
   }
 });
 
-// Delete
+
 router.delete("/:id", async (req, res) => {
   try {
     const { rows } = await pool.query("DELETE FROM size_reductions WHERE id=$1 RETURNING *", [req.params.id]);

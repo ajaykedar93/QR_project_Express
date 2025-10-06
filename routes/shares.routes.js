@@ -7,7 +7,6 @@ import { mailer } from "../utils/mailer.js";
 
 const router = Router();
 
-// Frontend URL where recipients open shares
 const APP_URL = "https://qr-project-react.vercel.app/";
 
 function buildShareUrl(shareId) {
@@ -15,21 +14,7 @@ function buildShareUrl(shareId) {
 }
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
-/* ============================================================
-  ONE-TIME MIGRATION (run in your DB)
-  -------------------------------------------------------------
-  CREATE TABLE IF NOT EXISTS share_dismissals (
-    share_id UUID NOT NULL REFERENCES shares(share_id) ON DELETE CASCADE,
-    user_id  UUID NOT NULL REFERENCES users(user_id)  ON DELETE CASCADE,
-    hidden_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (share_id, user_id)
-  );
-============================================================ */
 
-/* ============================================================
-  CREATE SHARE
-  POST /shares  (auth)
-============================================================ */
 router.post("/", auth, async (req, res) => {
   try {
     let {
@@ -45,7 +30,6 @@ router.post("/", auth, async (req, res) => {
 
     if (!document_id) return res.status(400).json({ error: "document_id required" });
 
-    // owner check
     const owns = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
       [document_id, req.user.user_id]
@@ -56,7 +40,7 @@ router.post("/", auth, async (req, res) => {
       return res.status(400).json({ error: "expiry_time must be in the future" });
     }
 
-    // resolve recipient registration
+
     let to_user_id = null;
     if (to_email) {
       const u = await pool.query(
@@ -66,7 +50,7 @@ router.post("/", auth, async (req, res) => {
       if (u.rowCount) to_user_id = u.rows[0].user_id;
     }
 
-    // access decision
+  
     let finalAccess;
     if (access === "private") {
       if (!to_email) {
@@ -103,10 +87,7 @@ router.post("/", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  MY SENT SHARES
-  GET /shares/mine  (auth)
-============================================================ */
+
 router.get("/mine", auth, async (req, res) => {
   try {
     const q = `
@@ -128,10 +109,6 @@ router.get("/mine", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  RECEIVED SHARES (active, excluding dismissed)
-  GET /shares/received  (auth)
-============================================================ */
 router.get("/received", auth, async (req, res) => {
   try {
     const q = `
@@ -159,10 +136,6 @@ router.get("/received", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  SHARE DETAILS (owner)
-  GET /shares/:share_id  (auth)
-============================================================ */
 router.get("/:share_id", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -200,10 +173,7 @@ router.get("/:share_id", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  MINIMAL (public)
-  GET /shares/:share_id/minimal
-============================================================ */
+
 router.get("/:share_id/minimal", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -234,10 +204,7 @@ router.get("/:share_id/minimal", async (req, res) => {
   }
 });
 
-/* ============================================================
-  REVOKE (owner)
-  POST /shares/:share_id/revoke  (auth)
-============================================================ */
+
 router.post("/:share_id/revoke", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -266,10 +233,7 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  DELETE (owner) – already in your file
-  DELETE /shares/:share_id  (auth)
-============================================================ */
+
 router.delete("/:share_id", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -300,16 +264,12 @@ router.delete("/:share_id", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  NEW: Recipient dismiss/hide (does NOT delete the share)
-  POST /shares/:share_id/dismiss   (auth)
-  -> hides from GET /shares/received for that user
-============================================================ */
+
 router.post("/:share_id/dismiss", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
 
-    // ensure the user is a valid recipient of this share
+  
     const chk = await pool.query(
       `
       SELECT 1
@@ -343,10 +303,7 @@ router.post("/:share_id/dismiss", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  NEW: Undo recipient dismiss
-  DELETE /shares/:share_id/dismiss  (auth)
-============================================================ */
+
 router.delete("/:share_id/dismiss", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -362,10 +319,7 @@ router.delete("/:share_id/dismiss", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  UPDATE EXPIRY (owner)
-  PATCH /shares/:share_id/expiry  (auth)
-============================================================ */
+
 router.patch("/:share_id/expiry", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -401,10 +355,7 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  EXPIRE NOW (owner)
-  POST /shares/:share_id/expire-now  (auth)
-============================================================ */
+
 router.post("/:share_id/expire-now", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -433,10 +384,7 @@ router.post("/:share_id/expire-now", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-  SEND OTP (private)
-  POST /shares/:share_id/otp/send
-============================================================ */
+
 router.post("/:share_id/otp/send", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -500,10 +448,6 @@ router.post("/:share_id/otp/send", async (req, res) => {
   }
 });
 
-/* ============================================================
-  VERIFY OTP
-  POST /shares/:share_id/otp/verify
-============================================================ */
 router.post("/:share_id/otp/verify", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -550,11 +494,7 @@ router.post("/:share_id/otp/verify", async (req, res) => {
   }
 });
 
-/* ============================================================
-  NOTIFY RECIPIENT (email with link + QR)
-  POST /shares/notify-share
-  POST /shares/otp/notify-share (alias)
-============================================================ */
+
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
@@ -623,24 +563,18 @@ async function notifyShareHandler(req, res) {
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
 
-/* ============================================================
-  NEW: Delete a document (owner) – cascades to shares
-  DELETE /documents/:document_id  (auth)
-============================================================ */
 router.delete("/documents/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
 
-    // authorize
+
     const chk = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
       [document_id, req.user.user_id]
     );
     if (!chk.rowCount) return res.status(404).json({ error: "Document not found" });
 
-    // (Optional) delete from blob storage here using file_path if you store externally.
-
-    // delete document (shares removed by ON DELETE CASCADE)
+    
     await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
 
     // log

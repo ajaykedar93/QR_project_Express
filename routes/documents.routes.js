@@ -9,7 +9,7 @@ import { upload, FILE_ROOT } from "../middleware/upload.js";
 
 const router = Router();
 
-// Content-Disposition helpers
+
 function cdInline(fileName) {
   const safe = (fileName || "file").replace(/"/g, "'");
   return `inline; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
@@ -19,7 +19,7 @@ function cdAttachment(fileName) {
   return `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
 }
 
-// Preview strategy
+
 function decidePreviewStrategy({ mime = "", file_name = "" }) {
   const ext = (path.extname(file_name || "").slice(1) || "").toLowerCase();
   if (/^application\/pdf$/i.test(mime) || ext === "pdf") return "pdf";
@@ -31,7 +31,7 @@ function decidePreviewStrategy({ mime = "", file_name = "" }) {
   return "other";
 }
 
-// Range streaming
+
 function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
   const stat = fs.statSync(absPath);
   const fileSize = stat.size;
@@ -60,9 +60,6 @@ function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
   fs.createReadStream(absPath).pipe(res);
 }
 
-/* ============================================================
-   LIST DOCUMENTS
-============================================================ */
 router.get("/", auth, async (req, res) => {
   try {
     const q = `
@@ -79,9 +76,7 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-   GET META
-============================================================ */
+
 router.get("/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;
@@ -104,14 +99,12 @@ router.get("/:document_id", async (req, res) => {
   }
 });
 
-/* ============================================================
-   UPLOAD DOCUMENT
-============================================================ */
+
 router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "file required" });
 
-    // Save relative path (so subfolder structure is preserved)
+ 
     const diskRelPath = path.relative(FILE_ROOT, req.file.path);
 
     const ins = `
@@ -136,9 +129,7 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
   }
 });
 
-/* ============================================================
-   DELETE DOCUMENT
-============================================================ */
+
 router.delete("/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
@@ -159,9 +150,6 @@ router.delete("/:document_id", auth, async (req, res) => {
   }
 });
 
-/* ============================================================
-   VIEW DOCUMENT
-============================================================ */
 router.get("/view/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;
@@ -183,9 +171,6 @@ router.get("/view/:document_id", async (req, res) => {
   }
 });
 
-/* ============================================================
-   DOWNLOAD DOCUMENT
-============================================================ */
 router.get("/download/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;

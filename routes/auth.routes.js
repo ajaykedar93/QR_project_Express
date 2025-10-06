@@ -9,7 +9,7 @@ import { mailer } from "../utils/mailer.js"; // Nodemailer transport (has sendMa
 
 const router = Router();
 
-/* ----------------------------- Helpers ----------------------------- */
+
 function normalizeStr(v) {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -25,11 +25,10 @@ function genOTP(length = 6) {
   return n.toString().padStart(length, "0");
 }
 
-/* ----------------------------- Config ----------------------------- */
-const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10")); // minutes
-const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.EMAIL_USER); // fallback to Gmail user
+const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10")); 
+const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.EMAIL_USER); 
 
-/* ----------------------------- Rate limits ----------------------------- */
+
 const loginLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 50,
@@ -55,11 +54,6 @@ const resetLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-/* ----------------------------- POST /auth/register ----------------------------- */
-/**
- * body: { full_name, email, password }
- * 201 -> { user_id, full_name, email, is_verified, created_at }
- */
 router.post("/register", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -90,7 +84,6 @@ router.post("/register", async (req, res) => {
     const { rows } = await client.query(insertSql, [full_name, email, password_hash]);
     const newUser = rows[0];
 
-    // Safety backfill for pending shares (optional)
     await client.query(
       `
         UPDATE shares
@@ -116,11 +109,6 @@ router.post("/register", async (req, res) => {
   }
 });
 
-/* ----------------------------- POST /auth/login ----------------------------- */
-/**
- * body: { email, password }
- * 200 -> { token, user:{ user_id, full_name, email, is_verified, created_at } }
- */
 router.post("/login", loginLimiter, async (req, res) => {
   try {
     let { email, password } = req.body || {};
@@ -170,11 +158,6 @@ router.post("/login", loginLimiter, async (req, res) => {
   }
 });
 
-/* ----------------------------- GET /auth/exists ----------------------------- */
-/**
- * query: ?email=...
- * 200 -> { exists: boolean }
- */
 router.get("/exists", existsLimiter, async (req, res) => {
   try {
     const email = normalizeStr(req.query.email || "");
@@ -188,11 +171,6 @@ router.get("/exists", existsLimiter, async (req, res) => {
   }
 });
 
-/* ----------------------------- GET /auth/me ----------------------------- */
-/**
- * header: Authorization: Bearer <token>
- * 200 -> { user_id, full_name, email, is_verified, created_at }
- */
 router.get("/me", auth, async (req, res) => {
   try {
     const q = `
@@ -210,13 +188,7 @@ router.get("/me", auth, async (req, res) => {
   }
 });
 
-/* --------------------- POST /auth/forgot (send OTP) --------------------- */
-/**
- * body: { email }
- * 200 -> { message: "If that account exists, an OTP has been sent." }
- *
- * Note: Responds generically to avoid account enumeration.
- */
+
 router.post("/forgot", forgotLimiter, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -230,7 +202,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       [email]
     );
 
-    // Always behave the same regardless of existence
+
     const otp = genOTP(6);
     const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000);
 
@@ -243,7 +215,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
         [otp, expiry.toISOString(), rows[0].user_id]
       );
 
-      // Send email using nodemailer transport
+     
       try {
         await mailer.sendMail({
           from: FROM_EMAIL,
@@ -276,12 +248,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
   }
 });
 
-/* ------------------ POST /auth/reset/verify (check OTP) ------------------ */
-/**
- * body: { email, otp }
- * 200 -> { ok: true }   // if valid & not expired
- * 400/404 -> error
- */
+
 router.post("/reset/verify", resetLimiter, async (req, res) => {
   try {
     const email = normalizeStr(req.body?.email || "");
@@ -316,11 +283,6 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
   }
 });
 
-/* ------------------ POST /auth/reset (verify & update) ------------------- */
-/**
- * body: { email, otp, new_password }
- * 200 -> { message: "Password updated" }
- */
 router.post("/reset", resetLimiter, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -366,7 +328,7 @@ router.post("/reset", resetLimiter, async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // Optional: notify success (non-sensitive)
+  
     try {
       await mailer.sendMail({
         from: FROM_EMAIL,

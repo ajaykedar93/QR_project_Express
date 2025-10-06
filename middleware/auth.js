@@ -1,13 +1,7 @@
 // middleware/auth.js
 import jwt from "jsonwebtoken";
 
-/**
- * Express middleware to authenticate requests using JWT.
- *
- * - Expects: Authorization: Bearer <token>
- * - On success: attaches { user_id, email } to req.user
- * - On failure: responds 401
- */
+
 export function auth(req, res, next) {
   try {
     const header = req.headers.authorization || "";
