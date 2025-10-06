@@ -1,15 +1,24 @@
 // utils/mailer.js
 import nodemailer from "nodemailer";
+import dotenv from "dotenv";
 
-// Check that credentials exist before creating transporter
-if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-  console.error("❌ Missing EMAIL_USER or EMAIL_PASS environment variables!");
-}
+dotenv.config(); // Load .env variables
 
+// ✅ Create Mailtrap transporter
 export const mailer = nodemailer.createTransport({
-  service: "gmail",
+  host: "live.smtp.mailtrap.io",
+  port: 587,
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
+    user: process.env.MAILTRAP_USER,
+    pass: process.env.MAILTRAP_TOKEN,
   },
+});
+
+// ✅ Optional: Verify connection at startup
+mailer.verify((error, success) => {
+  if (error) {
+    console.error("❌ Mailtrap connection failed:", error);
+  } else {
+    console.log("✅ Mailtrap ready to send emails!");
+  }
 });
