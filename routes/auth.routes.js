@@ -27,7 +27,7 @@ function genOTP(length = 6) {
 
 // Config
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
-const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.MAILTRAP_USER);
+const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.EMAIL_USER);
 
 // Rate limiters
 const loginLimiter = rateLimit({
