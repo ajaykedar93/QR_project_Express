@@ -207,8 +207,8 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       );
 
       try {
-        await mailer.sendMail({
-          from: FROM_EMAIL,
+         await mailer.sendMail({
+           from: process.env.EMAIL_USER,
           to: email,
           subject: "Your password reset code",
           text: `Your password reset code is: ${otp}\nExpires in ${OTP_WINDOW_MIN} minutes.`,
