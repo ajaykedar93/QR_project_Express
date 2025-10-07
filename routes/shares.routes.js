@@ -5,6 +5,8 @@ import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
 import { mailer } from "../utils/mailer.js";
 
+
+
 const router = Router();
 
 const APP_URL = "https://qr-project-react.vercel.app/";
@@ -600,5 +602,7 @@ router.delete("/documents/:document_id", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+
 
 export default router;

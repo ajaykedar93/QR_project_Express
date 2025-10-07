@@ -2,7 +2,7 @@
 import express from "express";
 import cors from "cors";
 
-
+import dotenv from "dotenv";
 import authRoutes from "./routes/auth.routes.js";          
 import miscRoutes from "./routes/misc.routes.js";          
 import sharesRoutes from "./routes/shares.routes.js";       
@@ -11,6 +11,8 @@ import reduceRoutes from "./routes/reduce.js";
 
 const app = express();
 app.set('trust proxy', 1);
+
+dotenv.config(); // Load environment variables
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" })); 
@@ -24,6 +26,8 @@ app.use("/misc", miscRoutes);
 app.use("/shares", sharesRoutes);
 app.use("/documents", documentsRoutes);
 app.use("/api/reduce", reduceRoutes);
+
+
 
 
 app.use((req, res) => {
