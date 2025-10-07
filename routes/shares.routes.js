@@ -495,6 +495,7 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 });
 
 
+/** Notify email handler */
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
@@ -516,6 +517,8 @@ async function notifyShareHandler(req, res) {
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
 
     const sh = rows[0];
+
+    // Validation
     if (String(sh.from_user_id) !== String(req.user.user_id)) {
       return res.status(403).json({ error: "Not allowed" });
     }
@@ -531,8 +534,11 @@ async function notifyShareHandler(req, res) {
     const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
 
     const subject =
-      sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
+      sh.access === "private"
+        ? "A private document was shared with you"
+        : "A public document was shared with you";
 
+    // ✅ Send Email using SendGrid
     await mailer.sendMail({
       from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
       to: recipient,
@@ -542,9 +548,13 @@ async function notifyShareHandler(req, res) {
         <p><b>File:</b> ${meta.document_name || sh.file_name} (${sh.mime_type || "file"})</p>
         <p><b>Access:</b> ${(meta.access || sh.access || "").toUpperCase()}</p>
         <p><b>Sender:</b> ${meta.sender_email || sh.from_email}</p>
-        ${sh.expiry_time ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>` : ""}
+        ${
+          sh.expiry_time
+            ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>`
+            : ""
+        }
         <p>Open link: <a href="${meta.frontend_link || openUrl}">${meta.frontend_link || openUrl}</a></p>
-        <p><img src="${meta.qr_image || qrImg}" alt="QR code to open the share" /></p>
+        <p><img src="${meta.qr_image || qrImg}" alt="QR code" /></p>
         <p>${
           sh.access === "private"
             ? `This is <b>PRIVATE</b>. Use your registered email; you'll get an OTP to view & download.`
@@ -560,13 +570,14 @@ async function notifyShareHandler(req, res) {
   }
 }
 
+/** Routes */
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
 
+/** Delete Document */
 router.delete("/documents/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
-
 
     const chk = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
@@ -574,10 +585,9 @@ router.delete("/documents/:document_id", auth, async (req, res) => {
     );
     if (!chk.rowCount) return res.status(404).json({ error: "Document not found" });
 
-    
     await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
 
-    // log
+    // Log deletion
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        VALUES (NULL, $1, $2, 'document_delete')`,
