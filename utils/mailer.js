@@ -1,19 +1,11 @@
-import sgMail from "@sendgrid/mail";
+import nodemailer from "nodemailer";
 
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-
-export const mailer = {
-  sendMail: async ({ to, subject, html, from }) => {
-    try {
-      await sgMail.send({
-        to,
-        from: from || `"QR-Docs" <${process.env.EMAIL_USER}>`,
-        subject,
-        html,
-      });
-    } catch (err) {
-      console.error("SENDGRID_ERROR:", err?.response?.body || err.message);
-      throw new Error("Failed to send email");
-    }
+export const mailer = nodemailer.createTransport({
+  host: "smtp.gmail.com",
+  port: 587,           // TLS port
+  secure: false,       // false for TLS
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS, 
   },
-};
+});

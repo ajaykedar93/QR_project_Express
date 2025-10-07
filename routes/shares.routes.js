@@ -5,8 +5,6 @@ import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
 import { mailer } from "../utils/mailer.js";
 
-
-
 const router = Router();
 
 const APP_URL = "https://qr-project-react.vercel.app/";
@@ -497,5 +495,100 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 });
 
 
+async function notifyShareHandler(req, res) {
+  try {
+    const { share_id, to_email = null, meta = {} } = req.body || {};
+    if (!share_id) return res.status(400).json({ error: "share_id required" });
+
+    const q = `
+      SELECT s.share_id, s.share_token, s.access, s.expiry_time, s.is_revoked,
+             s.to_user_id, s.to_user_email, s.from_user_id, s.document_id,
+             d.file_name, d.mime_type, d.file_size_bytes,
+             uf.full_name AS from_full_name, uf.email AS from_email,
+             ur.email     AS to_email_resolved
+        FROM shares s
+        JOIN documents d ON d.document_id = s.document_id
+        JOIN users uf     ON uf.user_id   = s.from_user_id
+   LEFT JOIN users ur     ON ur.user_id   = s.to_user_id
+       WHERE s.share_id = $1
+       LIMIT 1`;
+    const { rows } = await pool.query(q, [share_id]);
+    if (!rows.length) return res.status(404).json({ error: "Share not found" });
+
+    const sh = rows[0];
+    if (String(sh.from_user_id) !== String(req.user.user_id)) {
+      return res.status(403).json({ error: "Not allowed" });
+    }
+    if (sh.is_revoked) return res.status(403).json({ error: "Share revoked" });
+    if (sh.expiry_time && dayjs(sh.expiry_time).isBefore(dayjs())) {
+      return res.status(403).json({ error: "Share expired" });
+    }
+
+    const recipient = to_email || sh.to_email_resolved || sh.to_user_email;
+    if (!recipient) return res.status(400).json({ error: "No recipient email on this share" });
+
+    const openUrl = buildShareUrl(sh.share_id);
+    const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
+
+    const subject =
+      sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
+
+    await mailer.sendMail({
+      from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
+      to: recipient,
+      subject,
+      html: `
+        <p><b>${sh.from_full_name}</b> (${sh.from_email}) shared a document with you.</p>
+        <p><b>File:</b> ${meta.document_name || sh.file_name} (${sh.mime_type || "file"})</p>
+        <p><b>Access:</b> ${(meta.access || sh.access || "").toUpperCase()}</p>
+        <p><b>Sender:</b> ${meta.sender_email || sh.from_email}</p>
+        ${sh.expiry_time ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>` : ""}
+        <p>Open link: <a href="${meta.frontend_link || openUrl}">${meta.frontend_link || openUrl}</a></p>
+        <p><img src="${meta.qr_image || qrImg}" alt="QR code to open the share" /></p>
+        <p>${
+          sh.access === "private"
+            ? `This is <b>PRIVATE</b>. Use your registered email; you'll get an OTP to view & download.`
+            : `This is <b>PUBLIC (view-only)</b>.`
+        }</p>
+      `,
+    });
+
+    res.json({ success: true, notified: recipient });
+  } catch (err) {
+    console.error("NOTIFY_SHARE_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+}
+
+router.post("/notify-share", auth, notifyShareHandler);
+router.post("/otp/notify-share", auth, notifyShareHandler);
+
+router.delete("/documents/:document_id", auth, async (req, res) => {
+  try {
+    const { document_id } = req.params;
+
+
+    const chk = await pool.query(
+      `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
+      [document_id, req.user.user_id]
+    );
+    if (!chk.rowCount) return res.status(404).json({ error: "Document not found" });
+
+    
+    await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
+
+    // log
+    await pool.query(
+      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
+       VALUES (NULL, $1, $2, 'document_delete')`,
+      [document_id, req.user.user_id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DOCUMENT_DELETE_ERROR:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 export default router;

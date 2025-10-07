@@ -5,14 +5,11 @@ import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { mailer } from "../utils/mailer.js"; // SendGrid mailer
-import dotenv from "dotenv";
+import { mailer } from "../utils/mailer.js"; // Use correct SMTP mailer
 
-dotenv.config();
+const router = Router();
 
-// ----------------------
 // Helper functions
-// ----------------------
 function normalizeStr(v) {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -28,17 +25,11 @@ function genOTP(length = 6) {
   return n.toString().padStart(length, "0");
 }
 
-// ----------------------
 // Config
-// ----------------------
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
-const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.EMAIL_USER);
-const JWT_SECRET = mustEnv("JWT_SECRET", "dev-secret");
-const JWT_EXPIRES_IN = mustEnv("JWT_EXPIRES_IN", "7d");
+const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.MAILTRAP_USER);
 
-// ----------------------
 // Rate limiters
-// ----------------------
 const loginLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 50,
@@ -64,8 +55,6 @@ const resetLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const router = Router();
-
 // ----------------------
 // REGISTER
 // ----------------------
@@ -77,12 +66,9 @@ router.post("/register", async (req, res) => {
     email = normalizeStr(email);
     const pwd = String(password ?? "");
 
-    if (!full_name || !email || !pwd)
-      return res.status(400).json({ error: "Missing fields" });
-    if (!validEmail(email))
-      return res.status(400).json({ error: "Invalid email" });
-    if (pwd.trim().length < 8)
-      return res.status(400).json({ error: "Password too short" });
+    if (!full_name || !email || !pwd) return res.status(400).json({ error: "Missing fields" });
+    if (!validEmail(email)) return res.status(400).json({ error: "Invalid email" });
+    if (pwd.trim().length < 8) return res.status(400).json({ error: "Password too short" });
 
     const password_hash = await bcrypt.hash(pwd, 10);
     await client.query("BEGIN");
@@ -92,17 +78,13 @@ router.post("/register", async (req, res) => {
       VALUES ($1, $2, $3)
       RETURNING user_id, full_name, email, is_verified, created_at
     `;
-    const { rows } = await client.query(insertSql, [
-      full_name,
-      email,
-      password_hash,
-    ]);
+    const { rows } = await client.query(insertSql, [full_name, email, password_hash]);
     const newUser = rows[0];
 
-    // Update shared data if exists
+    // Update shares if any
     await client.query(
       `UPDATE shares
-       SET to_user_id = $1
+         SET to_user_id = $1
        WHERE to_user_id IS NULL
          AND to_user_email IS NOT NULL
          AND LOWER(to_user_email) = LOWER($2)`,
@@ -113,8 +95,7 @@ router.post("/register", async (req, res) => {
     return res.status(201).json(newUser);
   } catch (e) {
     await client.query("ROLLBACK");
-    if (e?.code === "23505")
-      return res.status(409).json({ error: "Email already registered" });
+    if (e?.code === "23505") return res.status(409).json({ error: "Email already registered" });
     console.error("REGISTER_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
   } finally {
@@ -131,8 +112,7 @@ router.post("/login", loginLimiter, async (req, res) => {
     email = normalizeStr(email);
     const pwd = String(password ?? "");
 
-    if (!email || !pwd.trim())
-      return res.status(400).json({ error: "Missing email or password" });
+    if (!email || !pwd.trim()) return res.status(400).json({ error: "Missing email or password" });
 
     const { rows } = await pool.query(
       `SELECT user_id, full_name, email, password_hash, is_verified, created_at
@@ -147,11 +127,10 @@ router.post("/login", loginLimiter, async (req, res) => {
     const ok = await bcrypt.compare(pwd, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-    const token = jwt.sign(
-      { user_id: user.user_id, email: user.email },
-      JWT_SECRET,
-      { expiresIn: JWT_EXPIRES_IN }
-    );
+    const secret = mustEnv("JWT_SECRET", "dev-secret");
+    const token = jwt.sign({ user_id: user.user_id, email: user.email }, secret, {
+      expiresIn: mustEnv("JWT_EXPIRES_IN", "7d"),
+    });
 
     return res.json({
       token,
@@ -177,10 +156,7 @@ router.get("/exists", existsLimiter, async (req, res) => {
     const email = normalizeStr(req.query.email || "");
     if (!email) return res.json({ exists: false });
 
-    const { rowCount } = await pool.query(
-      `SELECT 1 FROM users WHERE email = $1 LIMIT 1`,
-      [email]
-    );
+    const { rowCount } = await pool.query(`SELECT 1 FROM users WHERE email = $1 LIMIT 1`, [email]);
     res.json({ exists: rowCount > 0 });
   } catch (err) {
     console.error("USER_EXISTS_ERROR:", err);
@@ -200,8 +176,7 @@ router.get("/me", auth, async (req, res) => {
        LIMIT 1`,
       [req.user.user_id]
     );
-    if (!rows.length)
-      return res.status(404).json({ error: "User not found" });
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
     res.json(rows[0]);
   } catch (e) {
     console.error("ME_ERROR:", e);
@@ -210,30 +185,23 @@ router.get("/me", auth, async (req, res) => {
 });
 
 // ----------------------
-// FORGOT PASSWORD (Send OTP)
+// FORGOT PASSWORD (send OTP)
 // ----------------------
 router.post("/forgot", forgotLimiter, async (req, res) => {
   const client = await pool.connect();
   try {
     const email = normalizeStr(req.body?.email || "");
-    if (!email || !validEmail(email))
-      return res
-        .status(200)
-        .json({ message: "If that account exists, an OTP has been sent." });
+    if (!email || !validEmail(email)) return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
 
-    const { rows } = await client.query(
-      `SELECT user_id, email FROM users WHERE email = $1 LIMIT 1`,
-      [email]
-    );
-
+    const { rows } = await client.query(`SELECT user_id, email FROM users WHERE email = $1 LIMIT 1`, [email]);
     const otp = genOTP(6);
     const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000);
 
     if (rows.length) {
       await client.query(
         `UPDATE users
-         SET reset_token = $1,
-             reset_token_expiry = $2
+           SET reset_token = $1,
+               reset_token_expiry = $2
          WHERE user_id = $3`,
         [otp, expiry.toISOString(), rows[0].user_id]
       );
@@ -251,9 +219,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       }
     }
 
-    return res
-      .status(200)
-      .json({ message: "If that account exists, an OTP has been sent." });
+    return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
   } catch (e) {
     console.error("FORGOT_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
@@ -269,23 +235,15 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
   try {
     const email = normalizeStr(req.body?.email || "");
     const otp = normalizeStr(req.body?.otp || "");
-    if (!email || !otp)
-      return res.status(400).json({ error: "Missing email or otp" });
+    if (!email || !otp) return res.status(400).json({ error: "Missing email or otp" });
 
-    const { rows } = await pool.query(
-      `SELECT user_id, reset_token, reset_token_expiry
-       FROM users WHERE email = $1 LIMIT 1`,
-      [email]
-    );
+    const { rows } = await pool.query(`SELECT user_id, reset_token, reset_token_expiry
+                                        FROM users WHERE email = $1 LIMIT 1`, [email]);
     const user = rows[0];
-    if (
-      !user ||
-      !user.reset_token ||
-      !user.reset_token_expiry ||
-      user.reset_token !== otp ||
-      new Date() > new Date(user.reset_token_expiry)
-    )
-      return res.status(404).json({ error: "Invalid or expired code" });
+    if (!user || !user.reset_token || !user.reset_token_expiry) return res.status(404).json({ error: "Invalid or expired code" });
+
+    const now = new Date();
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) return res.status(404).json({ error: "Invalid or expired code" });
 
     return res.json({ ok: true });
   } catch (e) {
@@ -295,7 +253,7 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
 });
 
 // ----------------------
-// RESET PASSWORD (after OTP verified)
+// RESET PASSWORD
 // ----------------------
 router.post("/reset", resetLimiter, async (req, res) => {
   const client = await pool.connect();
@@ -304,37 +262,25 @@ router.post("/reset", resetLimiter, async (req, res) => {
     const otp = normalizeStr(req.body?.otp || "");
     const newPassword = String(req.body?.new_password ?? "");
 
-    if (!email || !otp || !newPassword.trim())
-      return res.status(400).json({ error: "Missing fields" });
-    if (newPassword.trim().length < 8)
-      return res.status(400).json({ error: "Password too short" });
+    if (!email || !otp || !newPassword.trim()) return res.status(400).json({ error: "Missing fields" });
+    if (newPassword.trim().length < 8) return res.status(400).json({ error: "Password too short" });
 
-    const { rows } = await client.query(
-      `SELECT user_id, reset_token, reset_token_expiry
-       FROM users WHERE email = $1 LIMIT 1`,
-      [email]
-    );
+    const { rows } = await client.query(`SELECT user_id, reset_token, reset_token_expiry
+                                        FROM users WHERE email = $1 LIMIT 1`, [email]);
     const user = rows[0];
-    if (
-      !user ||
-      !user.reset_token ||
-      !user.reset_token_expiry ||
-      user.reset_token !== otp ||
-      new Date() > new Date(user.reset_token_expiry)
-    )
-      return res.status(404).json({ error: "Invalid or expired code" });
+    if (!user || !user.reset_token || !user.reset_token_expiry) return res.status(404).json({ error: "Invalid or expired code" });
+
+    const now = new Date();
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) return res.status(404).json({ error: "Invalid or expired code" });
 
     const password_hash = await bcrypt.hash(newPassword, 10);
 
     await client.query("BEGIN");
-    await client.query(
-      `UPDATE users
-       SET password_hash = $1,
-           reset_token = NULL,
-           reset_token_expiry = NULL
-       WHERE user_id = $2`,
-      [password_hash, user.user_id]
-    );
+    await client.query(`UPDATE users
+                         SET password_hash = $1,
+                             reset_token = NULL,
+                             reset_token_expiry = NULL
+                       WHERE user_id = $2`, [password_hash, user.user_id]);
     await client.query("COMMIT");
 
     try {
@@ -349,7 +295,7 @@ router.post("/reset", resetLimiter, async (req, res) => {
       console.error("MAILER_ERROR[reset notify]:", mailErr);
     }
 
-    return res.json({ message: "Password updated successfully." });
+    return res.json({ message: "Password updated" });
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("RESET_ERROR:", e);
