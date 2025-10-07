@@ -4,6 +4,7 @@ import dayjs from "dayjs";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
 import { mailer } from "../utils/mailer.js";
+import { sendMail } from "../utils/mailer.js"; // <- Use your mailer.js
 
 
 
@@ -497,6 +498,7 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 });
 
 
+
 /** Notify email handler */
 async function notifyShareHandler(req, res) {
   try {
@@ -514,20 +516,19 @@ async function notifyShareHandler(req, res) {
         JOIN users uf     ON uf.user_id   = s.from_user_id
    LEFT JOIN users ur     ON ur.user_id   = s.to_user_id
        WHERE s.share_id = $1
-       LIMIT 1`;
+       LIMIT 1
+    `;
     const { rows } = await pool.query(q, [share_id]);
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
 
     const sh = rows[0];
 
     // Validation
-    if (String(sh.from_user_id) !== String(req.user.user_id)) {
+    if (String(sh.from_user_id) !== String(req.user.user_id))
       return res.status(403).json({ error: "Not allowed" });
-    }
     if (sh.is_revoked) return res.status(403).json({ error: "Share revoked" });
-    if (sh.expiry_time && dayjs(sh.expiry_time).isBefore(dayjs())) {
+    if (sh.expiry_time && dayjs(sh.expiry_time).isBefore(dayjs()))
       return res.status(403).json({ error: "Share expired" });
-    }
 
     const recipient = to_email || sh.to_email_resolved || sh.to_user_email;
     if (!recipient) return res.status(400).json({ error: "No recipient email on this share" });
@@ -535,14 +536,12 @@ async function notifyShareHandler(req, res) {
     const openUrl = buildShareUrl(sh.share_id);
     const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
 
-    const subject =
-      sh.access === "private"
-        ? "A private document was shared with you"
-        : "A public document was shared with you";
+    const subject = sh.access === "private"
+      ? "A private document was shared with you"
+      : "A public document was shared with you";
 
-    // ✅ Send Email using SendGrid
-    await mailer.sendMail({
-      from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
+    // ✅ Send email using mailer.js
+    await sendMail({
       to: recipient,
       subject,
       html: `
@@ -550,15 +549,10 @@ async function notifyShareHandler(req, res) {
         <p><b>File:</b> ${meta.document_name || sh.file_name} (${sh.mime_type || "file"})</p>
         <p><b>Access:</b> ${(meta.access || sh.access || "").toUpperCase()}</p>
         <p><b>Sender:</b> ${meta.sender_email || sh.from_email}</p>
-        ${
-          sh.expiry_time
-            ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>`
-            : ""
-        }
+        ${sh.expiry_time ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>` : ""}
         <p>Open link: <a href="${meta.frontend_link || openUrl}">${meta.frontend_link || openUrl}</a></p>
         <p><img src="${meta.qr_image || qrImg}" alt="QR code" /></p>
-        <p>${
-          sh.access === "private"
+        <p>${sh.access === "private"
             ? `This is <b>PRIVATE</b>. Use your registered email; you'll get an OTP to view & download.`
             : `This is <b>PUBLIC (view-only)</b>.`
         }</p>

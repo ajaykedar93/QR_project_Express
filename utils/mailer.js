@@ -1,12 +1,18 @@
-import nodemailer from "nodemailer";
-import dotenv from "dotenv";
+import sgMail from "@sendgrid/mail";
 
-dotenv.config(); // Load .env variables
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
-export const mailer = nodemailer.createTransport({
-  service: "SendGrid",
-  auth: {
-    user: "apikey", // <-- this must literally be the word "apikey"
-    pass: process.env.SENDGRID_API_KEY, // <-- your SendGrid API key from .env
-  },
-});
+export async function sendMail({ to, subject, html, from }) {
+  try {
+    await sgMail.send({
+      to,
+      from: from || `"QR-Docs" <${process.env.EMAIL_USER}>`,
+      subject,
+      html,
+    });
+    return true;
+  } catch (err) {
+    console.error("SENDGRID_ERROR:", err?.response?.body || err.message);
+    throw new Error("Failed to send email");
+  }
+}
