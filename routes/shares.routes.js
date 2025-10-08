@@ -1,9 +1,11 @@
-// routes/shares.routes.js
 import { Router } from "express";
 import dayjs from "dayjs";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { mailer } from "../utils/mailer.js";
+import { Resend } from 'resend';
+import "dotenv/config";
+
+const resend = new Resend(process.env.RESEND_API_KEY); // Your Resend API key
 
 const router = Router();
 
@@ -12,8 +14,8 @@ const APP_URL = "https://qr-project-react.vercel.app/";
 function buildShareUrl(shareId) {
   return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareId)}`;
 }
-const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
+const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
 router.post("/", auth, async (req, res) => {
   try {
@@ -40,7 +42,6 @@ router.post("/", auth, async (req, res) => {
       return res.status(400).json({ error: "expiry_time must be in the future" });
     }
 
-
     let to_user_id = null;
     if (to_email) {
       const u = await pool.query(
@@ -50,7 +51,6 @@ router.post("/", auth, async (req, res) => {
       if (u.rowCount) to_user_id = u.rows[0].user_id;
     }
 
-  
     let finalAccess;
     if (access === "private") {
       if (!to_email) {
@@ -80,13 +80,32 @@ router.post("/", auth, async (req, res) => {
       expiry_time || null,
     ]);
 
+    // Send email notification using Resend
+    const shareId = rows[0].share_id;
+    const shareUrl = buildShareUrl(shareId);
+    const qrImgUrl = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(shareUrl)}`;
+
+    // Send email with Resend
+    await resend.emails.send({
+      from: "noreply@qr-docs.com",
+      to: to_email,
+      subject: `A document has been shared with you`,
+      html: `
+        <p>You have received a document share from <strong>${req.user.full_name}</strong>.</p>
+        <p>Click the link below to view the document:</p>
+        <a href="${shareUrl}">${shareUrl}</a>
+        <p>This share is <strong>${finalAccess}</strong>.</p>
+        ${expiry_time ? `<p><strong>Expires at:</strong> ${new Date(expiry_time).toLocaleString()}</p>` : ""}
+        <p><img src="${qrImgUrl}" alt="QR code to view document" /></p>
+      `,
+    });
+
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error("SHARE_CREATE_ERROR:", err);
     return res.status(400).json({ error: err?.message || "Cannot create share" });
   }
 });
-
 
 router.get("/mine", auth, async (req, res) => {
   try {
@@ -108,6 +127,8 @@ router.get("/mine", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+// Additional routes (received, share details, revoke, delete, OTP etc.) would follow similar structure...
 
 router.get("/received", auth, async (req, res) => {
   try {
