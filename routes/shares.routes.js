@@ -3,27 +3,36 @@ import { Router } from "express";
 import dayjs from "dayjs";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
 import "dotenv/config";
 
 const router = Router();
 
 const APP_URL = "https://qr-project-react.vercel.app/";
 
+// ---------- helpers ----------
 function buildShareUrl(shareId) {
   return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareId)}`;
 }
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
-// ---- Gmail transporter (replaces utils/mailer.js) ----
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+// ---------- Resend (HTTPS email API) ----------
+const resend = new Resend(process.env.RESEND_API_KEY);
+// prefer a verified domain sender if you have one; fallback to Resend sandbox
+const FROM_EMAIL = process.env.EMAIL_FROM || "onboarding@resend.dev";
 
+async function sendMail({ to, subject, text, html }) {
+  // "to" can be string or array; keep it simple here
+  return await resend.emails.send({
+    from: FROM_EMAIL,
+    to,
+    subject,
+    text,
+    html,
+  });
+}
+
+// ----------------- Create Share -----------------
 router.post("/", auth, async (req, res) => {
   try {
     let {
@@ -94,6 +103,7 @@ router.post("/", auth, async (req, res) => {
   }
 });
 
+// ----------------- My Shares -----------------
 router.get("/mine", auth, async (req, res) => {
   try {
     const q = `
@@ -115,6 +125,7 @@ router.get("/mine", auth, async (req, res) => {
   }
 });
 
+// ----------------- Received Shares -----------------
 router.get("/received", auth, async (req, res) => {
   try {
     const q = `
@@ -142,6 +153,7 @@ router.get("/received", auth, async (req, res) => {
   }
 });
 
+// ----------------- Get One Share (owner) -----------------
 router.get("/:share_id", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -179,6 +191,7 @@ router.get("/:share_id", auth, async (req, res) => {
   }
 });
 
+// ----------------- Minimal Share (public/unauth) -----------------
 router.get("/:share_id/minimal", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -209,6 +222,7 @@ router.get("/:share_id/minimal", async (req, res) => {
   }
 });
 
+// ----------------- Revoke Share -----------------
 router.post("/:share_id/revoke", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -237,6 +251,7 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
   }
 });
 
+// ----------------- Delete Share -----------------
 router.delete("/:share_id", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -267,6 +282,7 @@ router.delete("/:share_id", auth, async (req, res) => {
   }
 });
 
+// ----------------- Dismiss Share (receiver) -----------------
 router.post("/:share_id/dismiss", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -304,6 +320,7 @@ router.post("/:share_id/dismiss", auth, async (req, res) => {
   }
 });
 
+// ----------------- Undismiss Share -----------------
 router.delete("/:share_id/dismiss", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -319,6 +336,7 @@ router.delete("/:share_id/dismiss", auth, async (req, res) => {
   }
 });
 
+// ----------------- Update Expiry -----------------
 router.patch("/:share_id/expiry", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -354,6 +372,7 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
   }
 });
 
+// ----------------- Expire Now -----------------
 router.post("/:share_id/expire-now", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -382,6 +401,7 @@ router.post("/:share_id/expire-now", auth, async (req, res) => {
   }
 });
 
+// ----------------- OTP: Send (via Resend) -----------------
 router.post("/:share_id/otp/send", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -425,12 +445,12 @@ router.post("/:share_id/otp/send", async (req, res) => {
     `;
     const { rows } = await pool.query(ins, [user.user_id, share_id, otp, expiry]);
 
-    // ---- send OTP email via Gmail transporter ----
-    await transporter.sendMail({
-      from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
+    // send OTP email via Resend
+    await sendMail({
       to: user.email,
       subject: "Your QR-Docs OTP",
       html: `<p>Your OTP is <b>${otp}</b>. It expires in ${ttlMins} minutes.</p>`,
+      text: `Your OTP is ${otp}. It expires in ${ttlMins} minutes.`,
     });
 
     await pool.query(
@@ -446,6 +466,7 @@ router.post("/:share_id/otp/send", async (req, res) => {
   }
 });
 
+// ----------------- OTP: Verify -----------------
 router.post("/:share_id/otp/verify", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -492,6 +513,7 @@ router.post("/:share_id/otp/verify", async (req, res) => {
   }
 });
 
+// ----------------- Notify Share (via Resend) -----------------
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
@@ -530,9 +552,7 @@ async function notifyShareHandler(req, res) {
     const subject =
       sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
 
-    // ---- send share notification via Gmail transporter ----
-    await transporter.sendMail({
-      from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
+    await sendMail({
       to: recipient,
       subject,
       html: `
@@ -549,6 +569,7 @@ async function notifyShareHandler(req, res) {
             : `This is <b>PUBLIC (view-only)</b>.`
         }</p>
       `,
+      text: `A document was shared with you by ${sh.from_full_name} (${sh.from_email}). Open: ${meta.frontend_link || openUrl}`,
     });
 
     res.json({ success: true, notified: recipient });
@@ -561,6 +582,7 @@ async function notifyShareHandler(req, res) {
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
 
+// ----------------- Delete Document -----------------
 router.delete("/documents/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
@@ -573,7 +595,6 @@ router.delete("/documents/:document_id", auth, async (req, res) => {
 
     await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
 
-    // log
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        VALUES (NULL, $1, $2, 'document_delete')`,

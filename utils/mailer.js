@@ -1,11 +1,23 @@
-import nodemailer from "nodemailer";
+// utils/mailer.js
+import { Resend } from "resend";
 
-export const mailer = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,           // TLS port
-  secure: false,       // false for TLS
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS, 
-  },
-});
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+/**
+ * Wrapper for sending emails with Resend
+ * @param {object} options
+ * @param {string} options.from
+ * @param {string|string[]} options.to
+ * @param {string} options.subject
+ * @param {string} [options.text]
+ * @param {string} [options.html]
+ */
+export async function sendMail({ from, to, subject, text, html }) {
+  return await resend.emails.send({
+    from,
+    to,
+    subject,
+    text,
+    html,
+  });
+}

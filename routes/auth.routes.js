@@ -5,12 +5,19 @@ import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-
-// ✅ Use Gmail via Nodemailer (same logic as requested)
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
 import "dotenv/config";
 
 const router = Router();
+
+// ---------- Email (Resend) ----------
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Minimal wrapper so the rest of the code is clean
+async function sendMail({ from, to, subject, text, html }) {
+  // Resend accepts string or array for "to"
+  return await resend.emails.send({ from, to, subject, text, html });
+}
 
 // ---------- Helpers ----------
 function normalizeStr(v) {
@@ -30,17 +37,8 @@ function genOTP(length = 6) {
 
 // ---------- Config ----------
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
-// default FROM = EMAIL_FROM if set, otherwise the Gmail account
-const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.EMAIL_USER);
-
-// ✅ Gmail transporter (exact logic you asked to use)
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+// Prefer your own domain sender if you’ve set one; fallback to Resend sandbox
+const FROM_EMAIL = mustEnv("EMAIL_FROM", "onboarding@resend.dev");
 
 // ---------- Rate limiters ----------
 const loginLimiter = rateLimit({
@@ -198,7 +196,7 @@ router.get("/me", auth, async (req, res) => {
 });
 
 // ----------------------
-// FORGOT PASSWORD (send OTP)
+// FORGOT PASSWORD (send OTP via Resend)
 // ----------------------
 router.post("/forgot", forgotLimiter, async (req, res) => {
   const client = await pool.connect();
@@ -207,7 +205,11 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
     // Always return 200 to avoid user enumeration
     if (!email || !validEmail(email)) return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
 
-    const { rows } = await client.query(`SELECT user_id, email FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const { rows } = await client.query(
+      `SELECT user_id, email FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
+
     const otp = genOTP(6);
     const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000);
 
@@ -220,9 +222,8 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
         [otp, expiry.toISOString(), rows[0].user_id]
       );
 
-      // ✅ Send via Gmail transporter
       try {
-        await transporter.sendMail({
+        await sendMail({
           from: FROM_EMAIL,
           to: email,
           subject: "Your password reset code",
@@ -277,7 +278,7 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
 });
 
 // ----------------------
-// RESET PASSWORD
+// RESET PASSWORD (notify via Resend)
 // ----------------------
 router.post("/reset", resetLimiter, async (req, res) => {
   const client = await pool.connect();
@@ -319,9 +320,9 @@ router.post("/reset", resetLimiter, async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // ✅ Notify via Gmail transporter (optional best-effort)
+    // Best-effort notify email
     try {
-      await transporter.sendMail({
+      await sendMail({
         from: FROM_EMAIL,
         to: email,
         subject: "Your password has been updated",
