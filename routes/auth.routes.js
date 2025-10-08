@@ -5,11 +5,14 @@ import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { mailer } from "../utils/mailer.js"; // Use correct SMTP mailer
+
+// ✅ Use Gmail via Nodemailer (same logic as requested)
+import nodemailer from "nodemailer";
+import "dotenv/config";
 
 const router = Router();
 
-// Helper functions
+// ---------- Helpers ----------
 function normalizeStr(v) {
   return typeof v === "string" ? v.trim() : "";
 }
@@ -25,11 +28,21 @@ function genOTP(length = 6) {
   return n.toString().padStart(length, "0");
 }
 
-// Config
+// ---------- Config ----------
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
-const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.MAILTRAP_USER);
+// default FROM = EMAIL_FROM if set, otherwise the Gmail account
+const FROM_EMAIL = mustEnv("EMAIL_FROM", process.env.EMAIL_USER);
 
-// Rate limiters
+// ✅ Gmail transporter (exact logic you asked to use)
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+// ---------- Rate limiters ----------
 const loginLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 50,
@@ -191,6 +204,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
   const client = await pool.connect();
   try {
     const email = normalizeStr(req.body?.email || "");
+    // Always return 200 to avoid user enumeration
     if (!email || !validEmail(email)) return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
 
     const { rows } = await client.query(`SELECT user_id, email FROM users WHERE email = $1 LIMIT 1`, [email]);
@@ -206,8 +220,9 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
         [otp, expiry.toISOString(), rows[0].user_id]
       );
 
+      // ✅ Send via Gmail transporter
       try {
-        await mailer.sendMail({
+        await transporter.sendMail({
           from: FROM_EMAIL,
           to: email,
           subject: "Your password reset code",
@@ -237,13 +252,22 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
     const otp = normalizeStr(req.body?.otp || "");
     if (!email || !otp) return res.status(400).json({ error: "Missing email or otp" });
 
-    const { rows } = await pool.query(`SELECT user_id, reset_token, reset_token_expiry
-                                        FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const { rows } = await pool.query(
+      `SELECT user_id, reset_token, reset_token_expiry
+         FROM users
+        WHERE email = $1
+        LIMIT 1`,
+      [email]
+    );
     const user = rows[0];
-    if (!user || !user.reset_token || !user.reset_token_expiry) return res.status(404).json({ error: "Invalid or expired code" });
+    if (!user || !user.reset_token || !user.reset_token_expiry) {
+      return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     const now = new Date();
-    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) return res.status(404).json({ error: "Invalid or expired code" });
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) {
+      return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     return res.json({ ok: true });
   } catch (e) {
@@ -265,26 +289,39 @@ router.post("/reset", resetLimiter, async (req, res) => {
     if (!email || !otp || !newPassword.trim()) return res.status(400).json({ error: "Missing fields" });
     if (newPassword.trim().length < 8) return res.status(400).json({ error: "Password too short" });
 
-    const { rows } = await client.query(`SELECT user_id, reset_token, reset_token_expiry
-                                        FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const { rows } = await client.query(
+      `SELECT user_id, reset_token, reset_token_expiry
+         FROM users
+        WHERE email = $1
+        LIMIT 1`,
+      [email]
+    );
     const user = rows[0];
-    if (!user || !user.reset_token || !user.reset_token_expiry) return res.status(404).json({ error: "Invalid or expired code" });
+    if (!user || !user.reset_token || !user.reset_token_expiry) {
+      return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     const now = new Date();
-    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) return res.status(404).json({ error: "Invalid or expired code" });
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) {
+      return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     const password_hash = await bcrypt.hash(newPassword, 10);
 
     await client.query("BEGIN");
-    await client.query(`UPDATE users
-                         SET password_hash = $1,
-                             reset_token = NULL,
-                             reset_token_expiry = NULL
-                       WHERE user_id = $2`, [password_hash, user.user_id]);
+    await client.query(
+      `UPDATE users
+          SET password_hash = $1,
+              reset_token = NULL,
+              reset_token_expiry = NULL
+        WHERE user_id = $2`,
+      [password_hash, user.user_id]
+    );
     await client.query("COMMIT");
 
+    // ✅ Notify via Gmail transporter (optional best-effort)
     try {
-      await mailer.sendMail({
+      await transporter.sendMail({
         from: FROM_EMAIL,
         to: email,
         subject: "Your password has been updated",

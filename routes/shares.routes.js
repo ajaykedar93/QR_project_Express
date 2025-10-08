@@ -3,7 +3,8 @@ import { Router } from "express";
 import dayjs from "dayjs";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { mailer } from "../utils/mailer.js";
+import nodemailer from "nodemailer";
+import "dotenv/config";
 
 const router = Router();
 
@@ -14,6 +15,14 @@ function buildShareUrl(shareId) {
 }
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 
+// ---- Gmail transporter (replaces utils/mailer.js) ----
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
 
 router.post("/", auth, async (req, res) => {
   try {
@@ -40,7 +49,6 @@ router.post("/", auth, async (req, res) => {
       return res.status(400).json({ error: "expiry_time must be in the future" });
     }
 
-
     let to_user_id = null;
     if (to_email) {
       const u = await pool.query(
@@ -50,7 +58,6 @@ router.post("/", auth, async (req, res) => {
       if (u.rowCount) to_user_id = u.rows[0].user_id;
     }
 
-  
     let finalAccess;
     if (access === "private") {
       if (!to_email) {
@@ -86,7 +93,6 @@ router.post("/", auth, async (req, res) => {
     return res.status(400).json({ error: err?.message || "Cannot create share" });
   }
 });
-
 
 router.get("/mine", auth, async (req, res) => {
   try {
@@ -173,7 +179,6 @@ router.get("/:share_id", auth, async (req, res) => {
   }
 });
 
-
 router.get("/:share_id/minimal", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -204,7 +209,6 @@ router.get("/:share_id/minimal", async (req, res) => {
   }
 });
 
-
 router.post("/:share_id/revoke", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -232,7 +236,6 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.delete("/:share_id", auth, async (req, res) => {
   try {
@@ -264,12 +267,10 @@ router.delete("/:share_id", auth, async (req, res) => {
   }
 });
 
-
 router.post("/:share_id/dismiss", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
 
-  
     const chk = await pool.query(
       `
       SELECT 1
@@ -303,7 +304,6 @@ router.post("/:share_id/dismiss", auth, async (req, res) => {
   }
 });
 
-
 router.delete("/:share_id/dismiss", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -318,7 +318,6 @@ router.delete("/:share_id/dismiss", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.patch("/:share_id/expiry", auth, async (req, res) => {
   try {
@@ -355,7 +354,6 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
   }
 });
 
-
 router.post("/:share_id/expire-now", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -383,7 +381,6 @@ router.post("/:share_id/expire-now", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.post("/:share_id/otp/send", async (req, res) => {
   try {
@@ -428,7 +425,8 @@ router.post("/:share_id/otp/send", async (req, res) => {
     `;
     const { rows } = await pool.query(ins, [user.user_id, share_id, otp, expiry]);
 
-    await mailer.sendMail({
+    // ---- send OTP email via Gmail transporter ----
+    await transporter.sendMail({
       from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
       to: user.email,
       subject: "Your QR-Docs OTP",
@@ -494,7 +492,6 @@ router.post("/:share_id/otp/verify", async (req, res) => {
   }
 });
 
-
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
@@ -533,7 +530,8 @@ async function notifyShareHandler(req, res) {
     const subject =
       sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
 
-    await mailer.sendMail({
+    // ---- send share notification via Gmail transporter ----
+    await transporter.sendMail({
       from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
       to: recipient,
       subject,
@@ -567,14 +565,12 @@ router.delete("/documents/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
 
-
     const chk = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
       [document_id, req.user.user_id]
     );
     if (!chk.rowCount) return res.status(404).json({ error: "Document not found" });
 
-    
     await pool.query(`DELETE FROM documents WHERE document_id=$1`, [document_id]);
 
     // log
