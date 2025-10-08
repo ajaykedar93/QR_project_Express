@@ -1,4 +1,3 @@
-// db/db.js
 import pkg from "pg";
 import "dotenv/config";
 
@@ -8,8 +7,12 @@ const { Pool } = pkg;
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false, // required for Supabase/AWS
+    rejectUnauthorized: false, // required for Supabase/AWS/Render
   },
+  max: 10,                   // max connections in pool
+  idleTimeoutMillis: 30000,  // close idle clients after 30s
+  connectionTimeoutMillis: 10000, // fail if connection not established in 10s
+  keepAlive: true,           // keep TCP connection alive
 });
 
 // Optional: test connection when server starts
