@@ -1,22 +1,29 @@
-// ✅ utils/mailer.js
-import dotenv from "dotenv";
+import { google } from "googleapis";
 import nodemailer from "nodemailer";
-
+import dotenv from "dotenv";
 dotenv.config();
 
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+const { EMAIL_USER, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, REFRESH_TOKEN } = process.env;
+
+const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+oAuth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
 
 export const sendEmail = async ({ to, subject, message, html, attachments = [] }) => {
-  if (!to || !subject || (!message && !html)) throw new Error("Missing fields");
+  const accessToken = await oAuth2Client.getAccessToken();
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      type: "OAuth2",
+      user: EMAIL_USER,
+      clientId: CLIENT_ID,
+      clientSecret: CLIENT_SECRET,
+      refreshToken: REFRESH_TOKEN,
+      accessToken: accessToken.token,
+    },
+  });
 
   await transporter.sendMail({
-    from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
+    from: `"QR-Docs" <${EMAIL_USER}>`,
     to,
     subject,
     text: message,

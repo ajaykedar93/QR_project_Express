@@ -31,6 +31,7 @@ function genOTP(length = 6) {
 
 // ---------- Config ----------
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
+// (Optional) used only for display; sendEmail already sets "from" using EMAIL_USER
 const FROM_EMAIL = process.env.EMAIL_USER || "noreply@qr-docs.app";
 
 // ---------- Rate limiters ----------
@@ -88,7 +89,7 @@ router.post("/register", async (req, res) => {
     const { rows } = await client.query(insertSql, [full_name, email, password_hash]);
     const newUser = rows[0];
 
-    // Send welcome email (optional)
+    // Welcome email (best-effort)
     try {
       await sendEmail({
         to: email,
@@ -124,9 +125,9 @@ router.post("/login", loginLimiter, async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT user_id, full_name, email, password_hash, is_verified, created_at
-       FROM users
-       WHERE email = $1
-       LIMIT 1`,
+         FROM users
+        WHERE email = $1
+        LIMIT 1`,
       [email]
     );
     const user = rows[0];
@@ -179,9 +180,9 @@ router.get("/me", auth, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT user_id, full_name, email, is_verified, created_at
-       FROM users
-       WHERE user_id = $1
-       LIMIT 1`,
+         FROM users
+        WHERE user_id = $1
+        LIMIT 1`,
       [req.user.user_id]
     );
     if (!rows.length) return res.status(404).json({ error: "User not found" });
@@ -197,8 +198,11 @@ router.get("/me", auth, async (req, res) => {
 // ----------------------
 router.post("/forgot", forgotLimiter, async (req, res) => {
   const email = normalizeStr(req.body?.email || "");
-  if (!email || !validEmail(email))
+
+  // Don't reveal user existence
+  if (!email || !validEmail(email)) {
     return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
+  }
 
   const client = await pool.connect();
   try {
@@ -213,12 +217,13 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
     if (rows.length) {
       await client.query(
         `UPDATE users
-           SET reset_token = $1,
-               reset_token_expiry = $2
-         WHERE user_id = $3`,
+            SET reset_token = $1,
+                reset_token_expiry = $2
+          WHERE user_id = $3`,
         [otp, expiry.toISOString(), rows[0].user_id]
       );
 
+      // ✅ Same sendEmail logic used for OTP email
       try {
         await sendEmail({
           to: email,
@@ -230,9 +235,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       }
     }
 
-    return res
-      .status(200)
-      .json({ message: "If that account exists, an OTP has been sent." });
+    return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
   } catch (e) {
     console.error("FORGOT_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
@@ -258,12 +261,14 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
       [email]
     );
     const user = rows[0];
-    if (!user || !user.reset_token || !user.reset_token_expiry)
+    if (!user || !user.reset_token || !user.reset_token_expiry) {
       return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     const now = new Date();
-    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry))
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) {
       return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     return res.json({ ok: true });
   } catch (e) {
@@ -280,10 +285,12 @@ router.post("/reset", resetLimiter, async (req, res) => {
   const otp = normalizeStr(req.body?.otp || "");
   const newPassword = String(req.body?.new_password ?? "").trim();
 
-  if (!email || !otp || !newPassword)
+  if (!email || !otp || !newPassword) {
     return res.status(400).json({ error: "Missing fields" });
-  if (newPassword.length < 8)
+  }
+  if (newPassword.length < 8) {
     return res.status(400).json({ error: "Password too short" });
+  }
 
   const client = await pool.connect();
   try {
@@ -295,12 +302,14 @@ router.post("/reset", resetLimiter, async (req, res) => {
       [email]
     );
     const user = rows[0];
-    if (!user || !user.reset_token || !user.reset_token_expiry)
+    if (!user || !user.reset_token || !user.reset_token_expiry) {
       return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     const now = new Date();
-    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry))
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) {
       return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     const password_hash = await bcrypt.hash(newPassword, 10);
 
@@ -315,13 +324,12 @@ router.post("/reset", resetLimiter, async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // Confirmation email
+    // ✅ Same sendEmail logic for confirmation (best-effort)
     try {
       await sendEmail({
         to: email,
         subject: "Your password has been updated",
-        html: `<p>Your password was changed successfully.</p>
-               <p>If this wasn't you, contact support immediately.</p>`,
+        html: `<p>Your password was changed successfully.</p><p>If this wasn't you, contact support immediately.</p>`,
       });
     } catch (mailErr) {
       console.error("MAILER_ERROR[reset notify]:", mailErr);
