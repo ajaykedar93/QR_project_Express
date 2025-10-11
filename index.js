@@ -14,6 +14,7 @@ import reduceRoutes from "./routes/reduce.js";
 const app = express();
 app.use(cors());  // CORS middleware
 app.use(express.json({ limit: "25mb" }));  // JSON parsing middleware
+app.set("trust proxy", 1);
 
 // Simple route to check API status
 app.get("/", (_req, res) => res.send("✅ QR-Docs API is running"));
