@@ -1,23 +1,28 @@
-// utils/mailer.js
-import { Resend } from "resend";
+// ✅ utils/mailer.js
+import dotenv from "dotenv";
+import nodemailer from "nodemailer";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+dotenv.config();
 
-/**
- * Wrapper for sending emails with Resend
- * @param {object} options
- * @param {string} options.from
- * @param {string|string[]} options.to
- * @param {string} options.subject
- * @param {string} [options.text]
- * @param {string} [options.html]
- */
-export async function sendMail({ from, to, subject, text, html }) {
-  return await resend.emails.send({
-    from,
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+export const sendEmail = async ({ to, subject, message, html, attachments = [] }) => {
+  if (!to || !subject || (!message && !html)) throw new Error("Missing fields");
+
+  await transporter.sendMail({
+    from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
     to,
     subject,
-    text,
-    html,
+    text: message,
+    html: html || `<p>${message}</p>`,
+    attachments,
   });
-}
+
+  console.log(`✅ Email sent to ${to}`);
+};

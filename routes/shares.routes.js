@@ -3,44 +3,55 @@ import { Router } from "express";
 import dayjs from "dayjs";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { mailer } from "../utils/mailer.js";
+import { sendEmail } from "../utils/mailer.js";
 
 const router = Router();
 
+// ✅ Frontend base URL (update if needed)
 const APP_URL = "https://qr-project-react.vercel.app/";
 
-function buildShareUrl(shareId) {
-  return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareId)}`;
+// ✅ Helper: build a full share URL from token/id
+function buildShareUrl(shareToken) {
+  return `${APP_URL.replace(/\/$/, "")}/share/${encodeURIComponent(shareToken)}`;
 }
+
+// ✅ Helper: check if a given ISO timestamp is in the future
 const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
+
+export { router, buildShareUrl, isFuture };
 
 
 router.post("/", auth, async (req, res) => {
   try {
-    let {
-      document_id,
-      to_email = "",
-      expiry_time = null,
-      access = null,
-    } = req.body || {};
+    let { document_id, to_email = "", expiry_time = null, access = null } = req.body || {};
 
     document_id = String(document_id || "").trim();
     to_email = String(to_email || "").trim();
     access = access ? String(access).toLowerCase() : null;
 
-    if (!document_id) return res.status(400).json({ error: "document_id required" });
+    if (!document_id)
+      return res.status(400).json({ error: "document_id required" });
 
+    // ✅ Check ownership
     const owns = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
       [document_id, req.user.user_id]
     );
-    if (!owns.rowCount) return res.status(404).json({ error: "Document not found" });
+    if (!owns.rowCount)
+      return res.status(404).json({ error: "Document not found or not owned by user" });
 
-    if (expiry_time && !isFuture(expiry_time)) {
-      return res.status(400).json({ error: "expiry_time must be in the future" });
+    // ✅ Validate expiry time (if given)
+    if (expiry_time) {
+      const expiry = new Date(expiry_time);
+      if (isNaN(expiry.getTime()) || expiry <= new Date()) {
+        return res.status(400).json({ error: "expiry_time must be in the future" });
+      }
+      expiry_time = expiry;
+    } else {
+      expiry_time = null;
     }
 
-
+    // ✅ Check recipient
     let to_user_id = null;
     if (to_email) {
       const u = await pool.query(
@@ -50,15 +61,13 @@ router.post("/", auth, async (req, res) => {
       if (u.rowCount) to_user_id = u.rows[0].user_id;
     }
 
-  
+    // ✅ Determine access type
     let finalAccess;
     if (access === "private") {
-      if (!to_email) {
+      if (!to_email)
         return res.status(400).json({ error: "Private share requires recipient email" });
-      }
-      if (!to_user_id) {
-        return res.status(400).json({ error: "Recipient email must be registered for private shares" });
-      }
+      if (!to_user_id)
+        return res.status(400).json({ error: "Recipient must be registered for private shares" });
       finalAccess = "private";
     } else if (access === "public") {
       finalAccess = "public";
@@ -66,59 +75,94 @@ router.post("/", auth, async (req, res) => {
       finalAccess = to_user_id ? "private" : "public";
     }
 
-    const ins = `
+    // ✅ Insert share
+    const insertQuery = `
       INSERT INTO shares (document_id, from_user_id, to_user_id, to_user_email, access, expiry_time)
-      VALUES ($1,$2,$3,$4,$5,$6)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING share_id, share_token, access, expiry_time, created_at
     `;
-    const { rows } = await pool.query(ins, [
+    const { rows } = await pool.query(insertQuery, [
       document_id,
       req.user.user_id,
       to_user_id,
-      to_user_id ? null : (to_email || null),
+      to_user_id ? null : to_email || null,
       finalAccess,
-      expiry_time || null,
+      expiry_time,
     ]);
 
-    res.status(201).json(rows[0]);
+    // ✅ Success
+    res.status(201).json({
+      success: true,
+      message: "Document shared successfully",
+      ...rows[0],
+    });
   } catch (err) {
-    console.error("SHARE_CREATE_ERROR:", err);
-    return res.status(400).json({ error: err?.message || "Cannot create share" });
+    console.error("❌ SHARE_CREATE_ERROR:", err);
+    return res
+      .status(400)
+      .json({ error: err?.message || "Cannot create share" });
   }
 });
-
 
 router.get("/mine", auth, async (req, res) => {
   try {
     const q = `
-      SELECT s.share_id, s.share_token, s.access, s.expiry_time, s.is_revoked, s.created_at,
-             s.to_user_id, s.to_user_email,
-             d.document_id, d.file_name, d.mime_type, d.file_size_bytes,
-             ru.full_name AS to_full_name, ru.email AS to_email_resolved
+      SELECT
+        s.share_id,
+        s.share_token,
+        s.access,
+        s.expiry_time,
+        s.is_revoked,
+        s.created_at,
+        s.to_user_id,
+        s.to_user_email,
+        d.document_id,
+        d.file_name,
+        d.mime_type,
+        d.file_size_bytes,
+        ru.full_name AS to_full_name,
+        ru.email AS to_email_resolved
       FROM shares s
       JOIN documents d ON d.document_id = s.document_id
       LEFT JOIN users ru ON ru.user_id = s.to_user_id
       WHERE s.from_user_id = $1
       ORDER BY s.created_at DESC
     `;
+
     const { rows } = await pool.query(q, [req.user.user_id]);
-    res.json(rows);
+    res.json({
+      success: true,
+      total: rows.length,
+      shares: rows,
+    });
   } catch (err) {
-    console.error("SHARES_MINE_ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("❌ SHARES_MINE_ERROR:", err);
+    res.status(500).json({ error: "Server error fetching your shared documents" });
   }
 });
 
 router.get("/received", auth, async (req, res) => {
   try {
     const q = `
-      SELECT s.share_id, s.share_token, s.access, s.expiry_time, s.created_at AS shared_at,
-             d.document_id, d.file_name, d.mime_type, d.file_size_bytes, d.created_at AS uploaded_at,
-             u.full_name AS from_full_name, u.email AS from_email
+      SELECT
+        s.share_id,
+        s.share_token,
+        s.access,
+        s.expiry_time,
+        s.created_at AS shared_at,
+        d.document_id,
+        d.file_name,
+        d.mime_type,
+        d.file_size_bytes,
+        d.created_at AS uploaded_at,
+        u.full_name AS from_full_name,
+        u.email AS from_email
       FROM shares s
       JOIN documents d ON d.document_id = s.document_id
       JOIN users u ON u.user_id = s.from_user_id
- LEFT JOIN share_dismissals sd ON sd.share_id = s.share_id AND sd.user_id = $1
+      LEFT JOIN share_dismissals sd
+             ON sd.share_id = s.share_id
+            AND sd.user_id = $1
       WHERE s.is_revoked = FALSE
         AND (s.expiry_time IS NULL OR s.expiry_time > now())
         AND sd.share_id IS NULL
@@ -128,14 +172,18 @@ router.get("/received", auth, async (req, res) => {
         )
       ORDER BY s.created_at DESC
     `;
+
     const { rows } = await pool.query(q, [req.user.user_id, req.user.email]);
-    res.json(rows);
+    res.json({
+      success: true,
+      total: rows.length,
+      received: rows,
+    });
   } catch (err) {
-    console.error("SHARES_RECEIVED_ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("❌ SHARES_RECEIVED_ERROR:", err);
+    res.status(500).json({ error: "Server error fetching received documents" });
   }
 });
-
 router.get("/:share_id", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -168,29 +216,27 @@ router.get("/:share_id", auth, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("SHARE_GET_ERROR:", err);
+    console.error("❌ SHARE_GET_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.get("/:share_id/minimal", async (req, res) => {
   try {
     const { share_id } = req.params;
     const q = `
-      SELECT s.share_id, s.document_id, s.access, s.expiry_time, s.is_revoked, s.to_user_email
-      FROM shares s
-      WHERE s.share_id = $1
+      SELECT share_id, document_id, access, expiry_time, is_revoked, to_user_email
+      FROM shares
+      WHERE share_id = $1
       LIMIT 1
     `;
     const { rows } = await pool.query(q, [share_id]);
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
-    const s = rows[0];
 
+    const s = rows[0];
     if (s.is_revoked) return res.status(403).json({ error: "Share revoked" });
-    if (s.expiry_time && dayjs(s.expiry_time).isBefore(dayjs())) {
+    if (s.expiry_time && new Date(s.expiry_time) <= new Date())
       return res.status(403).json({ error: "Share expired" });
-    }
 
     res.json({
       share_id: s.share_id,
@@ -199,40 +245,37 @@ router.get("/:share_id/minimal", async (req, res) => {
       to_user_email: s.to_user_email || null,
     });
   } catch (err) {
-    console.error("SHARE_MINIMAL_ERROR:", err);
+    console.error("❌ SHARE_MINIMAL_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.post("/:share_id/revoke", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
+
     const upd = await pool.query(
-      `
-        UPDATE shares
-           SET is_revoked = TRUE, revoked_at = now()
-         WHERE share_id = $1
-           AND from_user_id = $2
-         RETURNING share_id, is_revoked, revoked_at
-      `,
+      `UPDATE shares
+          SET is_revoked = TRUE, revoked_at = now()
+        WHERE share_id = $1 AND from_user_id = $2
+        RETURNING share_id, document_id, is_revoked, revoked_at`,
       [share_id, req.user.user_id]
     );
     if (!upd.rowCount) return res.status(404).json({ error: "Share not found" });
 
+    const sh = upd.rows[0];
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
-       SELECT $1, document_id, $2, 'share_revoke' FROM shares WHERE share_id=$1`,
-      [share_id, req.user.user_id]
+       VALUES ($1, $2, $3, 'share_revoke')`,
+      [share_id, sh.document_id, req.user.user_id]
     );
 
-    res.json(upd.rows[0]);
+    res.json(sh);
   } catch (err) {
-    console.error("SHARE_REVOKE_ERROR:", err);
+    console.error("❌ SHARE_REVOKE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.delete("/:share_id", auth, async (req, res) => {
   try {
@@ -247,10 +290,7 @@ router.delete("/:share_id", auth, async (req, res) => {
     const docId = sel.rows[0].document_id;
 
     await pool.query(`DELETE FROM otp_verifications WHERE share_id=$1 AND is_verified=FALSE`, [share_id]);
-
-    const del = await pool.query(`DELETE FROM shares WHERE share_id=$1 AND from_user_id=$2`, [share_id, req.user.user_id]);
-    if (!del.rowCount) return res.status(404).json({ error: "Share not found" });
-
+    await pool.query(`DELETE FROM shares WHERE share_id=$1 AND from_user_id=$2`, [share_id, req.user.user_id]);
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        VALUES ($1, $2, $3, 'share_delete')`,
@@ -259,50 +299,43 @@ router.delete("/:share_id", auth, async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error("SHARE_DELETE_ERROR:", err);
+    console.error("❌ SHARE_DELETE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.post("/:share_id/dismiss", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
 
-  
     const chk = await pool.query(
-      `
-      SELECT 1
-        FROM shares s
-       WHERE s.share_id = $1
-         AND s.is_revoked = FALSE
-         AND (s.expiry_time IS NULL OR s.expiry_time > now())
-         AND (
+      `SELECT 1
+         FROM shares s
+        WHERE s.share_id = $1
+          AND s.is_revoked = FALSE
+          AND (s.expiry_time IS NULL OR s.expiry_time > now())
+          AND (
               s.to_user_id = $2
               OR (s.to_user_id IS NULL AND LOWER(s.to_user_email) = LOWER($3))
-         )
-      LIMIT 1
-      `,
+          )
+        LIMIT 1`,
       [share_id, req.user.user_id, req.user.email]
     );
     if (!chk.rowCount) return res.status(404).json({ error: "Share not found for this user" });
 
     await pool.query(
-      `
-      INSERT INTO share_dismissals (share_id, user_id)
-      VALUES ($1, $2)
-      ON CONFLICT (share_id, user_id) DO NOTHING
-      `,
+      `INSERT INTO share_dismissals (share_id, user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (share_id, user_id) DO NOTHING`,
       [share_id, req.user.user_id]
     );
 
     res.json({ success: true });
   } catch (err) {
-    console.error("SHARE_DISMISS_ERROR:", err);
+    console.error("❌ SHARE_DISMISS_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.delete("/:share_id/dismiss", auth, async (req, res) => {
   try {
@@ -314,21 +347,18 @@ router.delete("/:share_id/dismiss", auth, async (req, res) => {
     if (!del.rowCount) return res.status(404).json({ error: "Not dismissed" });
     res.json({ success: true });
   } catch (err) {
-    console.error("SHARE_UNDISMISS_ERROR:", err);
+    console.error("❌ SHARE_UNDISMISS_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.patch("/:share_id/expiry", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
     let { expiry_time } = req.body || {};
 
-    if (expiry_time !== null && expiry_time !== undefined) {
-      if (!isFuture(expiry_time)) {
-        return res.status(400).json({ error: "expiry_time must be in the future (or null to remove)" });
-      }
+    if (expiry_time && new Date(expiry_time) <= new Date()) {
+      return res.status(400).json({ error: "expiry_time must be in the future or null" });
     }
 
     const sel = await pool.query(
@@ -350,16 +380,14 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
 
     res.json(upd.rows[0]);
   } catch (err) {
-    console.error("SHARE_EXPIRY_UPDATE_ERROR:", err);
+    console.error("❌ SHARE_EXPIRY_UPDATE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-
 router.post("/:share_id/expire-now", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
-
     const sel = await pool.query(
       `SELECT document_id FROM shares WHERE share_id=$1 AND from_user_id=$2 LIMIT 1`,
       [share_id, req.user.user_id]
@@ -379,11 +407,10 @@ router.post("/:share_id/expire-now", auth, async (req, res) => {
 
     res.json(upd.rows[0]);
   } catch (err) {
-    console.error("SHARE_EXPIRE_NOW_ERROR:", err);
+    console.error("❌ SHARE_EXPIRE_NOW_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 router.post("/:share_id/otp/send", async (req, res) => {
   try {
@@ -396,30 +423,23 @@ router.post("/:share_id/otp/send", async (req, res) => {
     const sh = sres.rows[0];
 
     if (sh.is_revoked) return res.status(403).json({ error: "Share revoked" });
-    if (sh.access !== "private") return res.status(400).json({ error: "OTP not required for public" });
-    if (sh.expiry_time && dayjs(sh.expiry_time).isBefore(dayjs())) {
+    if (sh.access !== "private") return res.status(400).json({ error: "OTP not required for public shares" });
+    if (sh.expiry_time && new Date(sh.expiry_time) <= new Date())
       return res.status(403).json({ error: "Share expired" });
-    }
 
-    const ures = await pool.query(
-      `SELECT user_id, email FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [email]
-    );
+    const ures = await pool.query(`SELECT user_id, email FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]);
     if (!ures.rowCount) return res.status(400).json({ error: "User must register first" });
     const user = ures.rows[0];
 
-    if (sh.to_user_id && String(sh.to_user_id) !== String(user.user_id)) {
+    // recipient must match share
+    if (sh.to_user_id && String(sh.to_user_id) !== String(user.user_id))
       return res.status(403).json({ error: "Not the intended recipient" });
-    }
-    if (!sh.to_user_id && sh.to_user_email) {
-      if (String(sh.to_user_email).toLowerCase() !== String(user.email).toLowerCase()) {
-        return res.status(403).json({ error: "Not the intended recipient" });
-      }
-    }
+    if (!sh.to_user_id && sh.to_user_email && sh.to_user_email.toLowerCase() !== user.email.toLowerCase())
+      return res.status(403).json({ error: "Not the intended recipient" });
 
     const otp = (Math.floor(100000 + Math.random() * 900000)).toString();
     const ttlMins = Number(process.env.OTP_TTL_MIN || 10);
-    const expiry = dayjs().add(ttlMins, "minute").toISOString();
+    const expiry = new Date(Date.now() + ttlMins * 60 * 1000).toISOString();
 
     const ins = `
       INSERT INTO otp_verifications (user_id, share_id, otp_code, expiry_time)
@@ -428,8 +448,7 @@ router.post("/:share_id/otp/send", async (req, res) => {
     `;
     const { rows } = await pool.query(ins, [user.user_id, share_id, otp, expiry]);
 
-    await mailer.sendMail({
-      from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
+    await sendEmail({
       to: user.email,
       subject: "Your QR-Docs OTP",
       html: `<p>Your OTP is <b>${otp}</b>. It expires in ${ttlMins} minutes.</p>`,
@@ -443,7 +462,7 @@ router.post("/:share_id/otp/send", async (req, res) => {
 
     res.json({ success: true, otp_id: rows[0].otp_id, expires_at: rows[0].expiry_time });
   } catch (err) {
-    console.error("OTP_SEND_ERROR:", err);
+    console.error("❌ OTP_SEND_ERROR:", err);
     res.status(400).json({ error: err.message || "Cannot send OTP" });
   }
 });
@@ -454,33 +473,25 @@ router.post("/:share_id/otp/verify", async (req, res) => {
     const { email, otp } = req.body || {};
     if (!email || !otp) return res.status(400).json({ error: "Email and OTP required" });
 
-    const u = await pool.query(
-      `SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`,
-      [email]
-    );
+    const u = await pool.query(`SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]);
     if (!u.rowCount) return res.status(400).json({ error: "User must register first" });
     const userId = u.rows[0].user_id;
 
     const f = await pool.query(
-      `
-        SELECT otp_id
-        FROM otp_verifications
-        WHERE share_id = $1
-          AND user_id  = $2
-          AND is_verified = FALSE
-          AND expiry_time > now()
-          AND otp_code = $3
+      `SELECT otp_id
+         FROM otp_verifications
+        WHERE share_id=$1
+          AND user_id=$2
+          AND is_verified=FALSE
+          AND expiry_time>now()
+          AND otp_code=$3
         ORDER BY created_at DESC
-        LIMIT 1
-      `,
+        LIMIT 1`,
       [share_id, userId, String(otp)]
     );
     if (!f.rowCount) return res.status(400).json({ error: "Invalid or expired OTP" });
 
-    await pool.query(`UPDATE otp_verifications SET is_verified = TRUE WHERE otp_id=$1`, [
-      f.rows[0].otp_id,
-    ]);
-
+    await pool.query(`UPDATE otp_verifications SET is_verified=TRUE WHERE otp_id=$1`, [f.rows[0].otp_id]);
     await pool.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
        SELECT $1, document_id, $2, 'otp_verify' FROM shares WHERE share_id=$1`,
@@ -489,59 +500,75 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error("OTP_VERIFY_ERROR:", err);
+    console.error("❌ OTP_VERIFY_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 
+
+// ✅ Final fixed handler
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
     if (!share_id) return res.status(400).json({ error: "share_id required" });
 
     const q = `
-      SELECT s.share_id, s.share_token, s.access, s.expiry_time, s.is_revoked,
-             s.to_user_id, s.to_user_email, s.from_user_id, s.document_id,
-             d.file_name, d.mime_type, d.file_size_bytes,
-             uf.full_name AS from_full_name, uf.email AS from_email,
-             ur.email     AS to_email_resolved
-        FROM shares s
-        JOIN documents d ON d.document_id = s.document_id
-        JOIN users uf     ON uf.user_id   = s.from_user_id
-   LEFT JOIN users ur     ON ur.user_id   = s.to_user_id
-       WHERE s.share_id = $1
-       LIMIT 1`;
+      SELECT 
+        s.share_id, 
+        s.share_token, 
+        s.access, 
+        s.expiry_time, 
+        s.is_revoked,
+        s.to_user_id, 
+        s.to_user_email, 
+        s.from_user_id, 
+        s.document_id,
+        d.file_name, 
+        d.mime_type, 
+        uf.full_name AS "from_full_name", 
+        uf.email AS "from_email",
+        ur.email AS "to_email_resolved"
+      FROM shares s
+      JOIN documents d ON d.document_id = s.document_id
+      JOIN users uf ON uf.user_id = s.from_user_id
+      LEFT JOIN users ur ON ur.user_id = s.to_user_id
+      WHERE s.share_id = $1
+      LIMIT 1;
+    `;
+
     const { rows } = await pool.query(q, [share_id]);
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
-
     const sh = rows[0];
-    if (String(sh.from_user_id) !== String(req.user.user_id)) {
+
+    // 🔒 Security validation
+    if (String(sh.from_user_id) !== String(req.user.user_id))
       return res.status(403).json({ error: "Not allowed" });
-    }
     if (sh.is_revoked) return res.status(403).json({ error: "Share revoked" });
-    if (sh.expiry_time && dayjs(sh.expiry_time).isBefore(dayjs())) {
+    if (sh.expiry_time && dayjs(sh.expiry_time).isBefore(dayjs()))
       return res.status(403).json({ error: "Share expired" });
-    }
 
+    // 🎯 Recipient
     const recipient = to_email || sh.to_email_resolved || sh.to_user_email;
-    if (!recipient) return res.status(400).json({ error: "No recipient email on this share" });
+    if (!recipient) return res.status(400).json({ error: "No recipient email" });
 
-    const openUrl = buildShareUrl(sh.share_id);
+    // 🧾 Generate QR + link
+    const openUrl = buildShareUrl(sh.share_token);
     const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
 
     const subject =
-      sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
+      sh.access === "private"
+        ? "A private document was shared with you"
+        : "A public document was shared with you";
 
-    await mailer.sendMail({
-      from: `"QR-Docs" <${process.env.EMAIL_USER}>`,
+    // ✉️ Send email
+    await sendEmail({
       to: recipient,
       subject,
       html: `
         <p><b>${sh.from_full_name}</b> (${sh.from_email}) shared a document with you.</p>
         <p><b>File:</b> ${meta.document_name || sh.file_name} (${sh.mime_type || "file"})</p>
         <p><b>Access:</b> ${(meta.access || sh.access || "").toUpperCase()}</p>
-        <p><b>Sender:</b> ${meta.sender_email || sh.from_email}</p>
         ${sh.expiry_time ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>` : ""}
         <p>Open link: <a href="${meta.frontend_link || openUrl}">${meta.frontend_link || openUrl}</a></p>
         <p><img src="${meta.qr_image || qrImg}" alt="QR code to open the share" /></p>
@@ -555,13 +582,16 @@ async function notifyShareHandler(req, res) {
 
     res.json({ success: true, notified: recipient });
   } catch (err) {
-    console.error("NOTIFY_SHARE_ERROR:", err);
-    res.status(500).json({ error: "Server error" });
+    console.error("❌ NOTIFY_SHARE_ERROR:", err);
+    res.status(500).json({ error: err.message || "Server error" });
   }
 }
 
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
+
+
+
 
 router.delete("/documents/:document_id", auth, async (req, res) => {
   try {

@@ -1,35 +1,28 @@
-// routes/auth.routes.js
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { Resend } from "resend";
+import { sendEmail } from "../utils/mailer.js"; // Import sendEmail utility
 import "dotenv/config";
 
 const router = Router();
-
-// ---------- Email (Resend) ----------
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-// Minimal wrapper so the rest of the code is clean
-async function sendMail({ from, to, subject, text, html }) {
-  // Resend accepts string or array for "to"
-  return await resend.emails.send({ from, to, subject, text, html });
-}
 
 // ---------- Helpers ----------
 function normalizeStr(v) {
   return typeof v === "string" ? v.trim() : "";
 }
+
 function mustEnv(name, fallback) {
   const val = process.env[name];
-  return val && val.length ? val : (fallback ?? "");
+  return val && val.length ? val : fallback ?? "";
 }
+
 function validEmail(email) {
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
 }
+
 function genOTP(length = 6) {
   const n = Math.floor(Math.random() * 1_000_000);
   return n.toString().padStart(length, "0");
@@ -37,8 +30,7 @@ function genOTP(length = 6) {
 
 // ---------- Config ----------
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
-// Prefer your own domain sender if you’ve set one; fallback to Resend sandbox
-const FROM_EMAIL = mustEnv("EMAIL_FROM", "onboarding@resend.dev");
+const FROM_EMAIL = mustEnv("EMAIL_FROM", "onboarding@yourdomain.com");
 
 // ---------- Rate limiters ----------
 const loginLimiter = rateLimit({
@@ -47,18 +39,21 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
 const existsLimiter = rateLimit({
   windowMs: 5 * 60 * 1000,
   max: 120,
   standardHeaders: true,
   legacyHeaders: false,
 });
+
 const forgotLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
 });
+
 const resetLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 50,
@@ -92,15 +87,18 @@ router.post("/register", async (req, res) => {
     const { rows } = await client.query(insertSql, [full_name, email, password_hash]);
     const newUser = rows[0];
 
-    // Update shares if any
-    await client.query(
-      `UPDATE shares
-         SET to_user_id = $1
-       WHERE to_user_id IS NULL
-         AND to_user_email IS NOT NULL
-         AND LOWER(to_user_email) = LOWER($2)`,
-      [newUser.user_id, newUser.email]
-    );
+    // Send a confirmation email after registration
+    try {
+      await sendEmail({
+        from: FROM_EMAIL,
+        to: email,
+        subject: "Welcome to Our Service!",
+        text: `Hi ${full_name},\n\nWelcome to our platform. We are excited to have you with us!`,
+        html: `<p>Hi <b>${full_name}</b>,</p><p>Welcome to our platform. We are excited to have you with us!</p>`,
+      });
+    } catch (mailErr) {
+      console.error("MAILER_ERROR[register]:", mailErr);
+    }
 
     await client.query("COMMIT");
     return res.status(201).json(newUser);
@@ -196,22 +194,22 @@ router.get("/me", auth, async (req, res) => {
 });
 
 // ----------------------
-// FORGOT PASSWORD (send OTP via Resend)
+// FORGOT PASSWORD (send OTP)
 // ----------------------
 router.post("/forgot", forgotLimiter, async (req, res) => {
+  const email = normalizeStr(req.body?.email || "");
+
+  if (!email || !validEmail(email)) return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
+
   const client = await pool.connect();
   try {
-    const email = normalizeStr(req.body?.email || "");
-    // Always return 200 to avoid user enumeration
-    if (!email || !validEmail(email)) return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
-
     const { rows } = await client.query(
       `SELECT user_id, email FROM users WHERE email = $1 LIMIT 1`,
       [email]
     );
 
-    const otp = genOTP(6);
-    const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000);
+    const otp = genOTP(6); // OTP length of 6 digits
+    const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000); // OTP expiry in 10 minutes
 
     if (rows.length) {
       await client.query(
@@ -223,12 +221,12 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       );
 
       try {
-        await sendMail({
+        await sendEmail({
           from: FROM_EMAIL,
           to: email,
           subject: "Your password reset code",
-          text: `Your password reset code is: ${otp}\nExpires in ${OTP_WINDOW_MIN} minutes.`,
-          html: `<p>Your password reset code is: <b>${otp}</b></p><p>Expires in ${OTP_WINDOW_MIN} minutes.</p>`,
+          text: `Your password reset code is: ${otp}\nExpires in 10 minutes.`,
+          html: `<p>Your password reset code is: <b>${otp}</b></p><p>Expires in 10 minutes.</p>`,
         });
       } catch (mailErr) {
         console.error("MAILER_ERROR[forgot]:", mailErr);
@@ -278,18 +276,18 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
 });
 
 // ----------------------
-// RESET PASSWORD (notify via Resend)
+// RESET PASSWORD (notify via Email)
 // ----------------------
 router.post("/reset", resetLimiter, async (req, res) => {
+  const email = normalizeStr(req.body?.email || "");
+  const otp = normalizeStr(req.body?.otp || "");
+  const newPassword = String(req.body?.new_password ?? "").trim();
+
+  if (!email || !otp || !newPassword) return res.status(400).json({ error: "Missing fields" });
+  if (newPassword.length < 8) return res.status(400).json({ error: "Password too short" });
+
   const client = await pool.connect();
   try {
-    const email = normalizeStr(req.body?.email || "");
-    const otp = normalizeStr(req.body?.otp || "");
-    const newPassword = String(req.body?.new_password ?? "");
-
-    if (!email || !otp || !newPassword.trim()) return res.status(400).json({ error: "Missing fields" });
-    if (newPassword.trim().length < 8) return res.status(400).json({ error: "Password too short" });
-
     const { rows } = await client.query(
       `SELECT user_id, reset_token, reset_token_expiry
          FROM users
@@ -297,6 +295,7 @@ router.post("/reset", resetLimiter, async (req, res) => {
         LIMIT 1`,
       [email]
     );
+
     const user = rows[0];
     if (!user || !user.reset_token || !user.reset_token_expiry) {
       return res.status(404).json({ error: "Invalid or expired code" });
@@ -320,9 +319,9 @@ router.post("/reset", resetLimiter, async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // Best-effort notify email
+    // Send confirmation email (Best-effort)
     try {
-      await sendMail({
+      await sendEmail({
         from: FROM_EMAIL,
         to: email,
         subject: "Your password has been updated",
