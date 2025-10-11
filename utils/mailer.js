@@ -6,8 +6,7 @@ dotenv.config();
 
 const { EMAIL_USER, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, REFRESH_TOKEN } = process.env;
 
-// Guard: show exactly what's missing (masked)
-function requireEnv() {
+(function requireEnv() {
   const missing = [];
   if (!EMAIL_USER) missing.push("EMAIL_USER");
   if (!CLIENT_ID) missing.push("CLIENT_ID");
@@ -15,11 +14,11 @@ function requireEnv() {
   if (!REDIRECT_URI) missing.push("REDIRECT_URI");
   if (!REFRESH_TOKEN) missing.push("REFRESH_TOKEN");
   if (missing.length) {
-    const hint = "Set these env vars in your hosting dashboard (Render) and redeploy.";
-    throw new Error(`Mailer OAuth2 env missing: ${missing.join(", ")}. ${hint}`);
+    throw new Error(
+      `Mailer OAuth2 env missing: ${missing.join(", ")}. Set these env vars in your host and restart.`
+    );
   }
-}
-requireEnv();
+})();
 
 const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 oAuth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
@@ -29,8 +28,9 @@ export const sendEmail = async ({ to, subject, message, html, attachments = [] }
     throw new Error("sendEmail: missing to/subject/body");
   }
 
-  // Will throw if refresh token is missing/invalid
-  const accessToken = await oAuth2Client.getAccessToken();
+  const accessTokenResp = await oAuth2Client.getAccessToken();
+  const accessToken =
+    typeof accessTokenResp === "string" ? accessTokenResp : accessTokenResp?.token;
 
   const transporter = nodemailer.createTransport({
     service: "gmail",
@@ -40,11 +40,11 @@ export const sendEmail = async ({ to, subject, message, html, attachments = [] }
       clientId: CLIENT_ID,
       clientSecret: CLIENT_SECRET,
       refreshToken: REFRESH_TOKEN,
-      accessToken: accessToken?.token,
+      accessToken,
     },
   });
 
-  await transporter.sendMail({
+  const info = await transporter.sendMail({
     from: `"QR-Docs" <${EMAIL_USER}>`,
     to,
     subject,
@@ -52,4 +52,6 @@ export const sendEmail = async ({ to, subject, message, html, attachments = [] }
     html: html || `<p>${message}</p>`,
     attachments,
   });
+
+  return info; // optional: caller can log or inspect
 };
