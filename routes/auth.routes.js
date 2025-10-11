@@ -1,10 +1,11 @@
+// ✅ routes/auth.routes.js
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { sendEmail } from "../utils/mailer.js"; // Import sendEmail utility
+import { sendEmail } from "../utils/mailer.js";
 import "dotenv/config";
 
 const router = Router();
@@ -30,7 +31,7 @@ function genOTP(length = 6) {
 
 // ---------- Config ----------
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
-const FROM_EMAIL = mustEnv("EMAIL_FROM", "onboarding@yourdomain.com");
+const FROM_EMAIL = process.env.EMAIL_USER || "noreply@qr-docs.app";
 
 // ---------- Rate limiters ----------
 const loginLimiter = rateLimit({
@@ -87,14 +88,12 @@ router.post("/register", async (req, res) => {
     const { rows } = await client.query(insertSql, [full_name, email, password_hash]);
     const newUser = rows[0];
 
-    // Send a confirmation email after registration
+    // Send welcome email (optional)
     try {
       await sendEmail({
-        from: FROM_EMAIL,
         to: email,
-        subject: "Welcome to Our Service!",
-        text: `Hi ${full_name},\n\nWelcome to our platform. We are excited to have you with us!`,
-        html: `<p>Hi <b>${full_name}</b>,</p><p>Welcome to our platform. We are excited to have you with us!</p>`,
+        subject: "Welcome to QR-Docs!",
+        html: `<p>Hi <b>${full_name}</b>,</p><p>Welcome to QR-Docs — your secure document sharing platform.</p>`,
       });
     } catch (mailErr) {
       console.error("MAILER_ERROR[register]:", mailErr);
@@ -198,8 +197,8 @@ router.get("/me", auth, async (req, res) => {
 // ----------------------
 router.post("/forgot", forgotLimiter, async (req, res) => {
   const email = normalizeStr(req.body?.email || "");
-
-  if (!email || !validEmail(email)) return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
+  if (!email || !validEmail(email))
+    return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
 
   const client = await pool.connect();
   try {
@@ -208,8 +207,8 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       [email]
     );
 
-    const otp = genOTP(6); // OTP length of 6 digits
-    const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000); // OTP expiry in 10 minutes
+    const otp = genOTP(6);
+    const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000);
 
     if (rows.length) {
       await client.query(
@@ -222,18 +221,18 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
 
       try {
         await sendEmail({
-          from: FROM_EMAIL,
           to: email,
           subject: "Your password reset code",
-          text: `Your password reset code is: ${otp}\nExpires in 10 minutes.`,
-          html: `<p>Your password reset code is: <b>${otp}</b></p><p>Expires in 10 minutes.</p>`,
+          html: `<p>Your password reset code is: <b>${otp}</b></p><p>Expires in ${OTP_WINDOW_MIN} minutes.</p>`,
         });
       } catch (mailErr) {
         console.error("MAILER_ERROR[forgot]:", mailErr);
       }
     }
 
-    return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
+    return res
+      .status(200)
+      .json({ message: "If that account exists, an OTP has been sent." });
   } catch (e) {
     console.error("FORGOT_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
@@ -259,14 +258,12 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
       [email]
     );
     const user = rows[0];
-    if (!user || !user.reset_token || !user.reset_token_expiry) {
+    if (!user || !user.reset_token || !user.reset_token_expiry)
       return res.status(404).json({ error: "Invalid or expired code" });
-    }
 
     const now = new Date();
-    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) {
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry))
       return res.status(404).json({ error: "Invalid or expired code" });
-    }
 
     return res.json({ ok: true });
   } catch (e) {
@@ -276,15 +273,17 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
 });
 
 // ----------------------
-// RESET PASSWORD (notify via Email)
+// RESET PASSWORD
 // ----------------------
 router.post("/reset", resetLimiter, async (req, res) => {
   const email = normalizeStr(req.body?.email || "");
   const otp = normalizeStr(req.body?.otp || "");
   const newPassword = String(req.body?.new_password ?? "").trim();
 
-  if (!email || !otp || !newPassword) return res.status(400).json({ error: "Missing fields" });
-  if (newPassword.length < 8) return res.status(400).json({ error: "Password too short" });
+  if (!email || !otp || !newPassword)
+    return res.status(400).json({ error: "Missing fields" });
+  if (newPassword.length < 8)
+    return res.status(400).json({ error: "Password too short" });
 
   const client = await pool.connect();
   try {
@@ -295,16 +294,13 @@ router.post("/reset", resetLimiter, async (req, res) => {
         LIMIT 1`,
       [email]
     );
-
     const user = rows[0];
-    if (!user || !user.reset_token || !user.reset_token_expiry) {
+    if (!user || !user.reset_token || !user.reset_token_expiry)
       return res.status(404).json({ error: "Invalid or expired code" });
-    }
 
     const now = new Date();
-    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry)) {
+    if (user.reset_token !== otp || now > new Date(user.reset_token_expiry))
       return res.status(404).json({ error: "Invalid or expired code" });
-    }
 
     const password_hash = await bcrypt.hash(newPassword, 10);
 
@@ -319,20 +315,19 @@ router.post("/reset", resetLimiter, async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // Send confirmation email (Best-effort)
+    // Confirmation email
     try {
       await sendEmail({
-        from: FROM_EMAIL,
         to: email,
         subject: "Your password has been updated",
-        text: "Your password was changed successfully. If this wasn't you, contact support immediately.",
-        html: "<p>Your password was changed successfully.</p><p>If this wasn't you, contact support immediately.</p>",
+        html: `<p>Your password was changed successfully.</p>
+               <p>If this wasn't you, contact support immediately.</p>`,
       });
     } catch (mailErr) {
       console.error("MAILER_ERROR[reset notify]:", mailErr);
     }
 
-    return res.json({ message: "Password updated" });
+    return res.json({ message: "Password updated successfully" });
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("RESET_ERROR:", e);
