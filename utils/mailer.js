@@ -68,7 +68,7 @@ export async function sendEmail({ to, subject, html, text = "" }) {
     const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
 
     const raw = buildRaw({
-      from: `Placement App <${SENDER_EMAIL}>`,
+      from: `QR Secure-Docs <${SENDER_EMAIL}>`,
       to: toList,
       subject,
       html,
