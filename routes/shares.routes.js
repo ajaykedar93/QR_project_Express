@@ -1,4 +1,5 @@
 // routes/shares.routes.js
+import 'dotenv/config';
 import { Router } from "express";
 import dayjs from "dayjs";
 import rateLimit from "express-rate-limit";
@@ -18,24 +19,9 @@ const isFuture = (iso) => !!iso && dayjs(iso).isAfter(dayjs());
 const isEmail = (s) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(s || "").trim());
 
 /* --------------------------- Rate Limiters ------------------------------ */
-const otpSendLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const otpVerifyLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const notifyLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const otpSendLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 30,  standardHeaders: true, legacyHeaders: false });
+const otpVerifyLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+const notifyLimiter   = rateLimit({ windowMs:  5 * 60 * 1000, max: 20,  standardHeaders: true, legacyHeaders: false });
 
 /* -------------------------------- Create ------------------------------- */
 // POST /shares  (idempotent)
@@ -639,12 +625,12 @@ router.post("/:share_id/otp/send", otpSendLimiter, async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Mail (non-blocking)
+    // Mail (non-blocking, HTTPS Gmail API)
     sendEmail({
       to: user.email,
       subject: "Your QR-Docs OTP",
       html: `<p>Your OTP is <b>${otp}</b>. It expires in ${OTP_TTL_MIN} minutes.</p>`,
-    }).catch((e) => console.error("MAILER_ERROR[share otp send]:", e));
+    }).catch((e) => console.error("MAILER_ERROR[share otp send]:", e?.message || e));
 
     res.json({
       success: true,
