@@ -540,12 +540,16 @@ router.post("/:share_id/otp/verify", async (req, res) => {
 
 // ✅ Final fixed handler
 // ✅ POST /shares/notify-share  (and /shares/otp/notify-share)
+
+// -------- NOTIFY SHARE (private/public) --------
+// POST /shares/notify-share
+// body: { share_id: string, to_email?: string, meta?: {document_name?, access?, frontend_link?, qr_image?} }
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
     if (!share_id) return res.status(400).json({ error: "share_id required" });
 
-    // Pull all fields needed for the email in one query
+    // Pull everything needed (note quoted aliases!)
     const q = `
       SELECT
         s.share_id,
@@ -567,24 +571,54 @@ async function notifyShareHandler(req, res) {
       JOIN users uf     ON uf.user_id   = s.from_user_id
  LEFT JOIN users ur     ON ur.user_id   = s.to_user_id
       WHERE s.share_id = $1
-      LIMIT 1;
-    `;
+      LIMIT 1`;
     const { rows } = await pool.query(q, [share_id]);
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
+
     const sh = rows[0];
 
-    // Permission + validity checks
-    if (String(sh.from_user_id) !== String(req.user.user_id))
+    // Only the owner can notify
+    if (String(sh.from_user_id) !== String(req.user.user_id)) {
       return res.status(403).json({ error: "Not allowed" });
+    }
     if (sh.is_revoked) return res.status(403).json({ error: "Share revoked" });
-    if (sh.expiry_time && new Date(sh.expiry_time) <= new Date())
+    if (sh.expiry_time && dayjs(sh.expiry_time).isBefore(dayjs())) {
       return res.status(403).json({ error: "Share expired" });
+    }
 
-    // Resolve recipient
-    const recipient = to_email || sh.to_email_resolved || sh.to_user_email;
-    if (!recipient) return res.status(400).json({ error: "No recipient email" });
+    // Resolve recipient:
+    // 1) explicit to_email from body, else 2) registered to_user, else 3) saved to_user_email
+    let recipient = (to_email || "").trim().toLowerCase() ||
+                    (sh.to_email_resolved || "") ||
+                    (sh.to_user_email || "");
 
-    // Build share link from share_token and a QR image
+    // Private: must match intended recipient (strict)
+    if (sh.access === "private") {
+      if (!recipient) return res.status(400).json({ error: "Private share requires a registered recipient email" });
+
+      // If share targets a user_id => make sure recipient is that user's email
+      if (sh.to_user_id) {
+        const chk = await pool.query(`SELECT email FROM users WHERE user_id=$1 LIMIT 1`, [sh.to_user_id]);
+        const intended = chk.rows?.[0]?.email?.toLowerCase() || "";
+        if (recipient.toLowerCase() !== intended) {
+          return res.status(403).json({ error: "Recipient must match the intended registered user" });
+        }
+      } else if (sh.to_user_email) {
+        // If share targets an email => must match, case-insensitive
+        if (recipient.toLowerCase() !== String(sh.to_user_email).toLowerCase()) {
+          return res.status(403).json({ error: "Recipient must match the intended email" });
+        }
+      } else {
+        return res.status(400).json({ error: "Private share missing recipient binding" });
+      }
+    } else {
+      // Public: allow explicit to_email; otherwise use stored recipient if present
+      if (!recipient) {
+        return res.status(400).json({ error: "No recipient email provided for public share" });
+      }
+    }
+
+    // Build link/QR (use share_token)
     const openUrl = buildShareUrl(sh.share_token);
     const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
 
@@ -593,7 +627,7 @@ async function notifyShareHandler(req, res) {
         ? "A private document was shared with you"
         : "A public document was shared with you";
 
-    // Send email (OAuth2-backed sendEmail)
+    // Send
     await sendEmail({
       to: recipient,
       subject,
@@ -612,14 +646,13 @@ async function notifyShareHandler(req, res) {
       `,
     });
 
-    res.json({ success: true, notified: recipient });
+    return res.json({ success: true, notified: recipient });
   } catch (err) {
     console.error("❌ NOTIFY_SHARE_ERROR:", err);
-    res.status(500).json({ error: err.message || "Server error" });
+    return res.status(500).json({ error: err.message || "Server error" });
   }
 }
 
-// Mount routes
 router.post("/notify-share", auth, notifyShareHandler);
 router.post("/otp/notify-share", auth, notifyShareHandler);
 
