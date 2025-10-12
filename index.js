@@ -1,7 +1,6 @@
 import "dotenv/config";  // ✅ ESM-safe dotenv
 import express from "express";
 import cors from "cors";
-import { sendEmail } from './utils/mailer.js';  // Correct path for mailer.js
 
 // Import routes
 import authRoutes from "./routes/auth.routes.js";

@@ -5,15 +5,26 @@ import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { sendEmail } from "../utils/mailer.js"; // Yahoo mailer (EMAIL_USER/EMAIL_PASS)
-import "dotenv/config";
-import { verifyMailer } from "./utils/mailer.js";
-verifyMailer().catch((e)=>console.error("SMTP verify failed:", e));
+import { sendEmail } from "../utils/mailer.js";
+import nodemailer from "nodemailer";
+import { google } from "googleapis";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const router = Router();
 
-/* ------------------------------- Helpers -------------------------------- */
+/* ----------------------------- Gmail OAuth2 ----------------------------- */
+const oAuth2Client = new google.auth.OAuth2(
+  process.env.CLIENT_ID,
+  process.env.CLIENT_SECRET,
+  process.env.REDIRECT_URI
+);
+if (process.env.REFRESH_TOKEN) {
+  oAuth2Client.setCredentials({ refresh_token: process.env.REFRESH_TOKEN });
+}
 
+/* ------------------------------- Helpers -------------------------------- */
 const normalizeStr = (v) => (typeof v === "string" ? v.trim() : "");
 const mustEnv = (name, fallback) => {
   const val = process.env[name];
@@ -24,21 +35,17 @@ const genOTP = (length = 6) => String(Math.floor(Math.random() * 1_000_000)).pad
 const nowIso = () => new Date().toISOString();
 
 /* -------------------------------- Config -------------------------------- */
-
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
-const JWT_SECRET = mustEnv("JWT_SECRET", "dev-secret");
+const JWT_SECRET = mustEnv("JWT_SECRET", "dev-secret"); // change in prod
 const JWT_EXPIRES_IN = mustEnv("JWT_EXPIRES_IN", "7d");
-const FROM_EMAIL = process.env.EMAIL_USER || "noreply@qr-docs.app"; // used in mailer "from" name/address
 
 /* ---------------------------- Rate Limiters ----------------------------- */
-
-const loginLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 50, standardHeaders: true, legacyHeaders: false });
-const existsLimiter = rateLimit({ windowMs: 5 * 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false });
-const forgotLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false });
-const resetLimiter  = rateLimit({ windowMs: 10 * 60 * 1000, max: 50, standardHeaders: true, legacyHeaders: false });
+const loginLimiter  = rateLimit({ windowMs: 10 * 60 * 1000, max: 50,  standardHeaders: true, legacyHeaders: false });
+const existsLimiter = rateLimit({ windowMs:  5 * 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false });
+const forgotLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 10,  standardHeaders: true, legacyHeaders: false });
+const resetLimiter  = rateLimit({ windowMs: 10 * 60 * 1000, max: 50,  standardHeaders: true, legacyHeaders: false });
 
 /* -------------------------------- Register ------------------------------ */
-
 router.post("/register", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -62,17 +69,18 @@ router.post("/register", async (req, res) => {
     );
     const newUser = rows[0];
 
-    // best-effort email (Yahoo mailer)
+    await client.query("COMMIT");
+
+    // Best-effort welcome email (non-blocking)
     sendEmail({
       to: email,
       subject: "Welcome to QR-Docs!",
       html: `<p>Hi <b>${full_name}</b>,</p><p>Welcome to QR-Docs — your secure document sharing platform.</p>`,
     }).catch((e) => console.error("MAILER_ERROR[register]:", e));
 
-    await client.query("COMMIT");
     return res.status(201).json(newUser);
   } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
+    try { await client.query("ROLLBACK"); } catch {}
     if (e?.code === "23505") return res.status(409).json({ error: "Email already registered" });
     console.error("REGISTER_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
@@ -82,7 +90,6 @@ router.post("/register", async (req, res) => {
 });
 
 /* --------------------------------- Login -------------------------------- */
-
 router.post("/login", loginLimiter, async (req, res) => {
   try {
     let { email, password } = req.body || {};
@@ -104,7 +111,11 @@ router.post("/login", loginLimiter, async (req, res) => {
     const ok = await bcrypt.compare(pwd, user.password_hash);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
-    const token = jwt.sign({ user_id: user.user_id, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    const token = jwt.sign(
+      { user_id: user.user_id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
 
     return res.json({
       token,
@@ -123,7 +134,6 @@ router.post("/login", loginLimiter, async (req, res) => {
 });
 
 /* --------------------------- Check Email Exists ------------------------- */
-
 router.get("/exists", existsLimiter, async (req, res) => {
   try {
     const email = normalizeStr(req.query.email || "");
@@ -137,7 +147,6 @@ router.get("/exists", existsLimiter, async (req, res) => {
 });
 
 /* ------------------------------ Current User ---------------------------- */
-
 router.get("/me", auth, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -158,14 +167,12 @@ router.get("/me", auth, async (req, res) => {
 /* -------------------------- Password Reset (OTP) ------------------------ */
 /**
  * We use otp_verifications table (share_id = NULL) for password reset OTPs.
- * To avoid multiple active resets, we proactively invalidate any previous
- * unverified/unexpired password-reset OTPs before inserting a new one.
+ * Before inserting a new OTP, proactively invalidate any previous
+ * unverified/unexpired password-reset OTPs.
  */
-
 router.post("/forgot", forgotLimiter, async (req, res) => {
   const email = normalizeStr(req.body?.email || "");
-
-  // Don’t reveal user existence
+  // Always respond 200 to avoid user enumeration
   if (!email || !validEmail(email)) {
     return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
   }
@@ -183,14 +190,13 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       const expiry = new Date(Date.now() + OTP_WINDOW_MIN * 60 * 1000);
 
       await client.query("BEGIN");
-      // Invalidate previous active password-reset OTPs (identified by share_id IS NULL)
       await client.query(
         `UPDATE otp_verifications
-            SET is_verified = TRUE
-          WHERE user_id = $1
-            AND share_id IS NULL
-            AND is_verified = FALSE
-            AND expiry_time > now()`,
+           SET is_verified = TRUE
+         WHERE user_id = $1
+           AND share_id IS NULL
+           AND is_verified = FALSE
+           AND expiry_time > now()`,
         [user.user_id]
       );
 
@@ -201,7 +207,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       );
       await client.query("COMMIT");
 
-      // best-effort email (Yahoo mailer)
+      // Non-blocking email
       sendEmail({
         to: email,
         subject: "Your password reset code",
@@ -213,7 +219,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
 
     return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
   } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("FORGOT_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
   } finally {
@@ -247,7 +253,6 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
       return res.status(404).json({ error: "Invalid or expired code" });
     }
 
-    // Mark as verified (so it can't be reused blindly)
     await pool.query(`UPDATE otp_verifications SET is_verified = TRUE WHERE otp_id = $1`, [rec.otp_id]);
 
     return res.json({ ok: true });
@@ -271,7 +276,6 @@ router.post("/reset", resetLimiter, async (req, res) => {
     const user = rows[0];
     if (!user) return res.status(404).json({ error: "Invalid or expired code" });
 
-    // Accept either: (a) already-verified OTP from /reset/verify OR (b) a fresh valid OTP by code
     const { rows: otpRows } = await client.query(
       `SELECT otp_id, expiry_time, is_verified
          FROM otp_verifications
@@ -283,17 +287,14 @@ router.post("/reset", resetLimiter, async (req, res) => {
       [user.user_id, otp]
     );
     const rec = otpRows[0];
-    if (!rec) return res.status(404).json({ error: "Invalid or expired code" });
-    if (new Date(rec.expiry_time) < new Date()) return res.status(404).json({ error: "Invalid or expired code" });
+    if (!rec || new Date(rec.expiry_time) < new Date()) {
+      return res.status(404).json({ error: "Invalid or expired code" });
+    }
 
     const password_hash = await bcrypt.hash(newPassword, 10);
 
     await client.query("BEGIN");
-
-    // Update password
     await client.query(`UPDATE users SET password_hash = $1 WHERE user_id = $2`, [password_hash, user.user_id]);
-
-    // Consume this OTP and invalidate any other active password-reset OTPs
     await client.query(`UPDATE otp_verifications SET is_verified = TRUE WHERE otp_id = $1`, [rec.otp_id]);
     await client.query(
       `UPDATE otp_verifications
@@ -304,23 +305,64 @@ router.post("/reset", resetLimiter, async (req, res) => {
           AND is_verified = FALSE`,
       [user.user_id]
     );
-
     await client.query("COMMIT");
 
-    // best-effort notify (Yahoo mailer)
+    // Non-blocking notification
     sendEmail({
       to: email,
       subject: "Your password has been updated",
-      html: `<p>Your password was changed successfully at ${nowIso()}.</p><p>If this wasn't you, contact support immediately.</p>`,
+      html: `<p>Your password was changed successfully at ${nowIso()}.</p>
+             <p>If this wasn't you, contact support immediately.</p>`,
     }).catch((e) => console.error("MAILER_ERROR[reset notify]:", e));
 
     return res.json({ message: "Password updated successfully" });
   } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("RESET_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
   } finally {
     client.release();
+  }
+});
+
+/* ----------------------------- Send Test Mail --------------------------- */
+router.post("/sendTestMail", async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || !validEmail(email)) {
+      return res.status(400).json({ success: false, message: "Valid email is required" });
+    }
+
+    // Get access token
+    const at = await oAuth2Client.getAccessToken();
+    const accessToken = typeof at === "string" ? at : at?.token;
+    if (!accessToken) throw new Error("Failed to get access token from Gmail API");
+
+    // Create transporter
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        type: "OAuth2",
+        user: process.env.SENDER_EMAIL,
+        clientId: process.env.CLIENT_ID,
+        clientSecret: process.env.CLIENT_SECRET,
+        refreshToken: process.env.REFRESH_TOKEN,
+        accessToken,
+      },
+    });
+
+    // Send email
+    await transporter.sendMail({
+      from: `Test Mailer <${process.env.SENDER_EMAIL}>`,
+      to: email,
+      subject: "✅ Gmail API Test Mail",
+      text: "This is a test email sent via Gmail API (OAuth2, no SMTP).",
+    });
+
+    res.json({ success: true, message: "Test mail sent successfully ✅" });
+  } catch (err) {
+    console.error("Mail error:", err?.message || err);
+    res.status(500).json({ success: false, message: err?.message || "Mail send failed" });
   }
 });
 

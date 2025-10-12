@@ -7,8 +7,6 @@ import { auth } from "../middleware/auth.js";
 import { sendEmail } from "../utils/mailer.js";
 
 const router = Router();
-import { verifyMailer } from "./utils/mailer.js";
-verifyMailer().catch((e)=>console.error("SMTP verify failed:", e));
 
 /* ------------------------------- Config -------------------------------- */
 const APP_URL = (process.env.FRONTEND_URL || "https://qr-project-react.vercel.app/").replace(/\/$/, "");
@@ -40,7 +38,6 @@ const notifyLimiter = rateLimit({
 });
 
 /* -------------------------------- Create ------------------------------- */
-// POST /shares
 // POST /shares  (idempotent)
 router.post("/", auth, async (req, res) => {
   const client = await pool.connect();
@@ -95,8 +92,6 @@ router.post("/", auth, async (req, res) => {
     }
 
     // ---------- IDEMPOTENT LOOKUP ----------
-    // Find an existing active share (not revoked, not expired) with same identity.
-    // For public shares, there is no recipient, so we match on NULL recipient.
     const existingSQL = `
       SELECT
         s.share_id, s.share_token, s.access, s.expiry_time, s.created_at
@@ -159,17 +154,15 @@ router.post("/", auth, async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
 
-    // If a DB trigger/constraint still fired (race), re-query the existing share and return it.
+    // Race-safe: if a unique/trigger fired, try to reuse
     const msg = String(err?.message || "").toLowerCase();
     if (msg.includes("duplicate active private share")) {
       try {
-        // Re-run the same idempotent lookup logic as above but using inputs from request again.
         let { document_id, to_email = "", access = null } = req.body || {};
         document_id = String(document_id || "").trim();
         to_email = String(to_email || "").trim();
         access = access ? String(access).toLowerCase() : null;
 
-        // Resolve access like before (minimal)
         let to_user_id = null;
         if (to_email) {
           const u = await pool.query(`SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [to_email]);
@@ -214,7 +207,6 @@ router.post("/", auth, async (req, res) => {
           });
         }
       } catch (e2) {
-        // fallthrough to generic error below
         console.error("SHARE_CREATE_RERESOLVE_ERROR:", e2);
       }
     }
@@ -339,7 +331,6 @@ router.get("/:share_id", auth, async (req, res) => {
 });
 
 // GET /shares/:share_id/minimal (public/private scan)
-// GET /shares/:share_id/minimal
 router.get("/:share_id/minimal", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -353,9 +344,8 @@ router.get("/:share_id/minimal", async (req, res) => {
       LIMIT 1
     `;
     const { rows } = await pool.query(q, [
-      // try to coerce to uuid; if not uuid, pass null so token branch is used
       /^[0-9a-f-]{36}$/i.test(share_id) ? share_id : null,
-      token || (!/^[0-9a-f-]{36}$/i.test(share_id) ? share_id : null) // treat path as token if not uuid
+      token || (!/^[0-9a-f-]{36}$/i.test(share_id) ? share_id : null)
     ]);
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
 
@@ -405,7 +395,7 @@ router.post("/:share_id/revoke", auth, async (req, res) => {
 
     res.json(sh);
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => {});
     console.error("SHARE_REVOKE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   } finally {
@@ -441,7 +431,7 @@ router.delete("/:share_id", auth, async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => {});
     console.error("SHARE_DELETE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   } finally {
@@ -536,7 +526,7 @@ router.patch("/:share_id/expiry", auth, async (req, res) => {
 
     res.json(upd.rows[0]);
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => {});
     console.error("SHARE_EXPIRY_UPDATE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   } finally {
@@ -574,7 +564,7 @@ router.post("/:share_id/expire-now", auth, async (req, res) => {
 
     res.json(upd.rows[0]);
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => {});
     console.error("SHARE_EXPIRE_NOW_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   } finally {
@@ -582,28 +572,35 @@ router.post("/:share_id/expire-now", auth, async (req, res) => {
   }
 });
 
-/* ------------------------------ OTP flows ------------------------------- */
-// POST /shares/:share_id/otp/send
+/* -------------------------- POST /shares/:share_id/otp/send -------------------------- */
 router.post("/:share_id/otp/send", otpSendLimiter, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { share_id } = req.params;
     const email = String(req.body?.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "Email required" });
     if (!isEmail(email)) return res.status(400).json({ error: "Invalid email" });
 
-    const sres = await pool.query(`SELECT * FROM shares WHERE share_id=$1 LIMIT 1`, [share_id]);
+    // Load share
+    const sres = await client.query(`SELECT * FROM shares WHERE share_id = $1 LIMIT 1`, [share_id]);
     if (!sres.rowCount) return res.status(404).json({ error: "Share not found" });
     const sh = sres.rows[0];
 
     if (sh.is_revoked) return res.status(403).json({ error: "Share revoked" });
     if (sh.access !== "private") return res.status(400).json({ error: "OTP not required for public shares" });
-    if (sh.expiry_time && new Date(sh.expiry_time) <= new Date()) return res.status(403).json({ error: "Share expired" });
+    if (sh.expiry_time && new Date(sh.expiry_time) <= new Date()) {
+      return res.status(403).json({ error: "Share expired" });
+    }
 
-    const ures = await pool.query(`SELECT user_id, email FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]);
+    // Resolve user by email
+    const ures = await client.query(
+      `SELECT user_id, email FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [email]
+    );
     if (!ures.rowCount) return res.status(400).json({ error: "User must register first" });
     const user = ures.rows[0];
 
-    // must match intended recipient
+    // Intended recipient check
     if (sh.to_user_id && String(sh.to_user_id) !== String(user.user_id)) {
       return res.status(403).json({ error: "Not the intended recipient" });
     }
@@ -611,82 +608,128 @@ router.post("/:share_id/otp/send", otpSendLimiter, async (req, res) => {
       return res.status(403).json({ error: "Not the intended recipient" });
     }
 
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
-    const expiry = new Date(Date.now() + OTP_TTL_MIN * 60 * 1000).toISOString();
+    const otp = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
+    const expiry = new Date(Date.now() + OTP_TTL_MIN * 60 * 1000);
+
+    await client.query("BEGIN");
+    // Invalidate any active unverified OTPs for this (user, share)
+    await client.query(
+      `UPDATE otp_verifications
+         SET is_verified = TRUE
+       WHERE user_id = $1
+         AND share_id = $2
+         AND is_verified = FALSE
+         AND expiry_time > now()`,
+      [user.user_id, share_id]
+    );
 
     const ins = `
-      INSERT INTO otp_verifications (user_id, share_id, otp_code, expiry_time)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO otp_verifications (user_id, share_id, otp_code, expiry_time, is_verified, created_at)
+      VALUES ($1, $2, $3, $4, FALSE, now())
       RETURNING otp_id, expiry_time
     `;
-    const { rows } = await pool.query(ins, [user.user_id, share_id, otp, expiry]);
+    const insRes = await client.query(ins, [user.user_id, share_id, otp, expiry.toISOString()]);
 
-    await sendEmail({
-      to: user.email,
-      subject: "Your QR-Docs OTP",
-      html: `<p>Your OTP is <b>${otp}</b>. It expires in ${OTP_TTL_MIN} minutes.</p>`,
-    });
-
-    await pool.query(
+    // Access log (otp request)
+    await client.query(
       `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
-       SELECT $1, document_id, $2, 'otp_request' FROM shares WHERE share_id=$1`,
+       SELECT $1, document_id, $2, 'otp_request' FROM shares WHERE share_id = $1`,
       [share_id, user.user_id]
     );
 
-    res.json({ success: true, otp_id: rows[0].otp_id, expires_at: rows[0].expiry_time });
+    await client.query("COMMIT");
+
+    // Mail (non-blocking)
+    sendEmail({
+      to: user.email,
+      subject: "Your QR-Docs OTP",
+      html: `<p>Your OTP is <b>${otp}</b>. It expires in ${OTP_TTL_MIN} minutes.</p>`,
+    }).catch((e) => console.error("MAILER_ERROR[share otp send]:", e));
+
+    res.json({
+      success: true,
+      otp_id: insRes.rows[0].otp_id,
+      expires_at: insRes.rows[0].expiry_time,
+    });
   } catch (err) {
-    if (String(err.message || "").toLowerCase().includes("only one active")) {
-      return res.status(429).json({ error: "An active OTP already exists. Please wait then try again." });
-    }
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("OTP_SEND_ERROR:", err);
-    res.status(400).json({ error: err.message || "Cannot send OTP" });
+    return res.status(400).json({ error: "Cannot send OTP" });
+  } finally {
+    client.release();
   }
 });
 
-// POST /shares/:share_id/otp/verify
+/* -------------------------- POST /shares/:share_id/otp/verify -------------------------- */
 router.post("/:share_id/otp/verify", otpVerifyLimiter, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { share_id } = req.params;
     const email = String(req.body?.email || "").trim().toLowerCase();
     const otp = String(req.body?.otp || "").trim();
+
     if (!email || !otp) return res.status(400).json({ error: "Email and OTP required" });
     if (!isEmail(email)) return res.status(400).json({ error: "Invalid email" });
 
-    const u = await pool.query(`SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [email]);
+    const u = await client.query(
+      `SELECT user_id FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [email]
+    );
     if (!u.rowCount) return res.status(400).json({ error: "User must register first" });
     const userId = u.rows[0].user_id;
 
-    const f = await pool.query(
+    // Find latest matching active OTP
+    const f = await client.query(
       `SELECT otp_id
          FROM otp_verifications
-        WHERE share_id=$1
-          AND user_id=$2
-          AND is_verified=FALSE
-          AND expiry_time>now()
-          AND otp_code=$3
+        WHERE share_id = $1
+          AND user_id  = $2
+          AND is_verified = FALSE
+          AND expiry_time > now()
+          AND otp_code = $3
         ORDER BY created_at DESC
         LIMIT 1`,
       [share_id, userId, otp]
     );
     if (!f.rowCount) return res.status(400).json({ error: "Invalid or expired OTP" });
 
-    await pool.query(`UPDATE otp_verifications SET is_verified=TRUE WHERE otp_id=$1`, [f.rows[0].otp_id]);
+    await client.query("BEGIN");
+    await client.query(`UPDATE otp_verifications SET is_verified = TRUE WHERE otp_id = $1`, [f.rows[0].otp_id]);
 
-    await pool.query(
-      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
-       SELECT $1, document_id, $2, 'otp_verify' FROM shares WHERE share_id=$1`,
+    // Hardening: invalidate any other active OTPs
+    await client.query(
+      `UPDATE otp_verifications
+          SET is_verified = TRUE
+        WHERE share_id = $1
+          AND user_id  = $2
+          AND is_verified = FALSE
+          AND expiry_time > now()`,
       [share_id, userId]
     );
 
+    // Access log (otp verify)
+    await client.query(
+      `INSERT INTO access_logs(share_id, document_id, viewer_user_id, action)
+       SELECT $1, document_id, $2, 'otp_verify' FROM shares WHERE share_id = $1`,
+      [share_id, userId]
+    );
+
+    await client.query("COMMIT");
     res.json({ success: true });
   } catch (err) {
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("OTP_VERIFY_ERROR:", err);
     res.status(500).json({ error: "Server error" });
+  } finally {
+    client.release();
   }
 });
 
 /* --------------------------- Notify recipient --------------------------- */
-// POST /shares/notify-share  (and /shares/otp/notify-share)
+/* POST /shares/notify-share  (and /shares/otp/notify-share)
+   Body:
+   { "share_id": "<uuid>", "to_email": "optional@example.com", "meta": { document_name?, access?, frontend_link?, qr_image? } }
+*/
 async function notifyShareHandler(req, res) {
   try {
     const { share_id, to_email = null, meta = {} } = req.body || {};
@@ -710,17 +753,23 @@ async function notifyShareHandler(req, res) {
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
     const sh = rows[0];
 
-    if (String(sh.from_user_id) !== String(req.user.user_id)) return res.status(403).json({ error: "Not allowed" });
+    // Only the sender can notify
+    if (String(sh.from_user_id) !== String(req.user.user_id)) {
+      return res.status(403).json({ error: "Not allowed" });
+    }
     if (sh.is_revoked) return res.status(403).json({ error: "Share revoked" });
-    if (sh.expiry_time && new Date(sh.expiry_time) <= new Date()) return res.status(403).json({ error: "Share expired" });
+    if (sh.expiry_time && new Date(sh.expiry_time) <= new Date()) {
+      return res.status(403).json({ error: "Share expired" });
+    }
 
-    const recipient = to_email || sh.to_email_resolved || sh.to_user_email;
+    const recipient = (to_email || sh.to_email_resolved || sh.to_user_email || "").trim();
     if (!recipient) return res.status(400).json({ error: "No recipient email" });
     if (!isEmail(recipient)) return res.status(400).json({ error: "Invalid recipient email" });
 
-    const openUrl = buildShareUrl(sh.share_token);
-    const qrImg = `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
-    const subject = sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
+    const openUrl = meta.frontend_link || buildShareUrl(sh.share_token);
+    const qrImg   = meta.qr_image || `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(openUrl)}`;
+    const subject =
+      sh.access === "private" ? "A private document was shared with you" : "A public document was shared with you";
 
     await sendEmail({
       to: recipient,
@@ -730,11 +779,11 @@ async function notifyShareHandler(req, res) {
         <p><b>File:</b> ${meta.document_name || sh.file_name} (${sh.mime_type || "file"})</p>
         <p><b>Access:</b> ${(meta.access || sh.access || "").toUpperCase()}</p>
         ${sh.expiry_time ? `<p><b>Expires:</b> ${new Date(sh.expiry_time).toLocaleString()}</p>` : ""}
-        <p>Open link: <a href="${meta.frontend_link || openUrl}">${meta.frontend_link || openUrl}</a></p>
-        <p><img src="${meta.qr_image || qrImg}" alt="QR code to open the share" /></p>
+        <p>Open link: <a href="${openUrl}">${openUrl}</a></p>
+        <p><img src="${qrImg}" alt="QR code to open the share" /></p>
         <p>${
           sh.access === "private"
-            ? `This is <b>PRIVATE</b>. Use your registered email; you'll get an OTP to view & download.`
+            ? `This is <b>PRIVATE</b>. Use your registered email; you'll receive an OTP to view & download.`
             : `This is <b>PUBLIC (view-only)</b>.`
         }</p>
       `,
@@ -778,7 +827,7 @@ router.delete("/documents/:document_id", auth, async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => {});
     console.error("DOCUMENT_DELETE_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   } finally {
