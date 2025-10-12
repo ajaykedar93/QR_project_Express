@@ -1,28 +1,14 @@
 // routes/auth.routes.js
+import 'dotenv/config'; // load env first
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { sendEmail } from "../utils/mailer.js";
-import nodemailer from "nodemailer";
-import { google } from "googleapis";
-import dotenv from "dotenv";
-
-dotenv.config();
+import { sendEmail } from "../utils/mailer.js"; // HTTPS Gmail API sender (no SMTP)
 
 const router = Router();
-
-/* ----------------------------- Gmail OAuth2 ----------------------------- */
-const oAuth2Client = new google.auth.OAuth2(
-  process.env.CLIENT_ID,
-  process.env.CLIENT_SECRET,
-  process.env.REDIRECT_URI
-);
-if (process.env.REFRESH_TOKEN) {
-  oAuth2Client.setCredentials({ refresh_token: process.env.REFRESH_TOKEN });
-}
 
 /* ------------------------------- Helpers -------------------------------- */
 const normalizeStr = (v) => (typeof v === "string" ? v.trim() : "");
@@ -31,7 +17,8 @@ const mustEnv = (name, fallback) => {
   return val && val.length ? val : fallback ?? "";
 };
 const validEmail = (email) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
-const genOTP = (length = 6) => String(Math.floor(Math.random() * 1_000_000)).padStart(length, "0");
+const genOTP = (length = 6) =>
+  String(Math.floor(Math.random() * 1_000_000)).padStart(length, "0");
 const nowIso = () => new Date().toISOString();
 
 /* -------------------------------- Config -------------------------------- */
@@ -68,15 +55,14 @@ router.post("/register", async (req, res) => {
       [full_name, email, password_hash]
     );
     const newUser = rows[0];
-
     await client.query("COMMIT");
 
-    // Best-effort welcome email (non-blocking)
+    // Best-effort welcome email (non-blocking, HTTPS Gmail API)
     sendEmail({
       to: email,
       subject: "Welcome to QR-Docs!",
-      html: `<p>Hi <b>${full_name}</b>,</p><p>Welcome to QR-Docs — your secure document sharing platform.</p>`,
-    }).catch((e) => console.error("MAILER_ERROR[register]:", e));
+      html: `<p>Hi <b>${full_name}</b>,</p><p>Welcome to QR-Docs — your secure document sharing platform.</p>`
+    }).catch((e) => console.error("MAILER_ERROR[register]:", e?.message || e));
 
     return res.status(201).json(newUser);
   } catch (e) {
@@ -138,7 +124,10 @@ router.get("/exists", existsLimiter, async (req, res) => {
   try {
     const email = normalizeStr(req.query.email || "");
     if (!email) return res.json({ exists: false });
-    const { rowCount } = await pool.query(`SELECT 1 FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const { rowCount } = await pool.query(
+      `SELECT 1 FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
     res.json({ exists: rowCount > 0 });
   } catch (err) {
     console.error("USER_EXISTS_ERROR:", err);
@@ -207,14 +196,14 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       );
       await client.query("COMMIT");
 
-      // Non-blocking email
+      // Non-blocking email (HTTPS Gmail API)
       sendEmail({
         to: email,
         subject: "Your password reset code",
         html: `<p>Hi${user.full_name ? ` <b>${user.full_name}</b>` : ""},</p>
                <p>Your password reset code is: <b>${otp}</b></p>
-               <p>It expires in ${OTP_WINDOW_MIN} minutes.</p>`,
-      }).catch((e) => console.error("MAILER_ERROR[forgot]:", e));
+               <p>It expires in ${OTP_WINDOW_MIN} minutes.</p>`
+      }).catch((e) => console.error("MAILER_ERROR[forgot]:", e?.message || e));
     }
 
     return res.status(200).json({ message: "If that account exists, an OTP has been sent." });
@@ -233,7 +222,10 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
     const otp = normalizeStr(req.body?.otp || "");
     if (!email || !otp) return res.status(400).json({ error: "Missing email or otp" });
 
-    const { rows } = await pool.query(`SELECT user_id FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const { rows } = await pool.query(
+      `SELECT user_id FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
     const user = rows[0];
     if (!user) return res.status(404).json({ error: "Invalid or expired code" });
 
@@ -253,7 +245,10 @@ router.post("/reset/verify", resetLimiter, async (req, res) => {
       return res.status(404).json({ error: "Invalid or expired code" });
     }
 
-    await pool.query(`UPDATE otp_verifications SET is_verified = TRUE WHERE otp_id = $1`, [rec.otp_id]);
+    await pool.query(
+      `UPDATE otp_verifications SET is_verified = TRUE WHERE otp_id = $1`,
+      [rec.otp_id]
+    );
 
     return res.json({ ok: true });
   } catch (e) {
@@ -272,7 +267,10 @@ router.post("/reset", resetLimiter, async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const { rows } = await client.query(`SELECT user_id FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const { rows } = await client.query(
+      `SELECT user_id FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
     const user = rows[0];
     if (!user) return res.status(404).json({ error: "Invalid or expired code" });
 
@@ -307,13 +305,13 @@ router.post("/reset", resetLimiter, async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // Non-blocking notification
+    // Non-blocking notification (HTTPS Gmail API)
     sendEmail({
       to: email,
       subject: "Your password has been updated",
       html: `<p>Your password was changed successfully at ${nowIso()}.</p>
-             <p>If this wasn't you, contact support immediately.</p>`,
-    }).catch((e) => console.error("MAILER_ERROR[reset notify]:", e));
+             <p>If this wasn't you, contact support immediately.</p>`
+    }).catch((e) => console.error("MAILER_ERROR[reset notify]:", e?.message || e));
 
     return res.json({ message: "Password updated successfully" });
   } catch (e) {
@@ -326,6 +324,7 @@ router.post("/reset", resetLimiter, async (req, res) => {
 });
 
 /* ----------------------------- Send Test Mail --------------------------- */
+// Uses the SAME HTTPS mailer as forgot/reset to avoid config drift
 router.post("/sendTestMail", async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -333,30 +332,11 @@ router.post("/sendTestMail", async (req, res) => {
       return res.status(400).json({ success: false, message: "Valid email is required" });
     }
 
-    // Get access token
-    const at = await oAuth2Client.getAccessToken();
-    const accessToken = typeof at === "string" ? at : at?.token;
-    if (!accessToken) throw new Error("Failed to get access token from Gmail API");
-
-    // Create transporter
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: {
-        type: "OAuth2",
-        user: process.env.SENDER_EMAIL,
-        clientId: process.env.CLIENT_ID,
-        clientSecret: process.env.CLIENT_SECRET,
-        refreshToken: process.env.REFRESH_TOKEN,
-        accessToken,
-      },
-    });
-
-    // Send email
-    await transporter.sendMail({
-      from: `Test Mailer <${process.env.SENDER_EMAIL}>`,
+    await sendEmail({
       to: email,
       subject: "✅ Gmail API Test Mail",
-      text: "This is a test email sent via Gmail API (OAuth2, no SMTP).",
+      html: "<p>This email was sent via <b>Gmail API over HTTPS</b> (no SMTP ports).</p>",
+      text: "This email was sent via Gmail API over HTTPS (no SMTP ports)."
     });
 
     res.json({ success: true, message: "Test mail sent successfully ✅" });
