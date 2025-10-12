@@ -5,7 +5,7 @@ import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
-import { sendEmail } from "../utils/mailer.js";
+import { sendEmail } from "../utils/mailer.js"; // Yahoo mailer (EMAIL_USER/EMAIL_PASS)
 import "dotenv/config";
 
 const router = Router();
@@ -26,7 +26,7 @@ const nowIso = () => new Date().toISOString();
 const OTP_WINDOW_MIN = Number(mustEnv("OTP_WINDOW_MIN", "10"));
 const JWT_SECRET = mustEnv("JWT_SECRET", "dev-secret");
 const JWT_EXPIRES_IN = mustEnv("JWT_EXPIRES_IN", "7d");
-const FROM_EMAIL = process.env.EMAIL_USER || "noreply@qr-docs.app";
+const FROM_EMAIL = process.env.EMAIL_USER || "noreply@qr-docs.app"; // used in mailer "from" name/address
 
 /* ---------------------------- Rate Limiters ----------------------------- */
 
@@ -60,7 +60,7 @@ router.post("/register", async (req, res) => {
     );
     const newUser = rows[0];
 
-    // best-effort email
+    // best-effort email (Yahoo mailer)
     sendEmail({
       to: email,
       subject: "Welcome to QR-Docs!",
@@ -70,7 +70,7 @@ router.post("/register", async (req, res) => {
     await client.query("COMMIT");
     return res.status(201).json(newUser);
   } catch (e) {
-    await pool.query("ROLLBACK").catch(() => {});
+    await client.query("ROLLBACK").catch(() => {});
     if (e?.code === "23505") return res.status(409).json({ error: "Email already registered" });
     console.error("REGISTER_ERROR:", e);
     return res.status(500).json({ error: "Server error" });
@@ -156,8 +156,8 @@ router.get("/me", auth, async (req, res) => {
 /* -------------------------- Password Reset (OTP) ------------------------ */
 /**
  * We use otp_verifications table (share_id = NULL) for password reset OTPs.
- * To avoid multiple active resets (trigger checks only per (user, share)),
- * we proactively invalidate any previous unverified/unexpired password-reset OTPs.
+ * To avoid multiple active resets, we proactively invalidate any previous
+ * unverified/unexpired password-reset OTPs before inserting a new one.
  */
 
 router.post("/forgot", forgotLimiter, async (req, res) => {
@@ -170,7 +170,10 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const { rows } = await client.query(`SELECT user_id, email, full_name FROM users WHERE email = $1 LIMIT 1`, [email]);
+    const { rows } = await client.query(
+      `SELECT user_id, email, full_name FROM users WHERE email = $1 LIMIT 1`,
+      [email]
+    );
     const user = rows[0];
 
     if (user) {
@@ -196,7 +199,7 @@ router.post("/forgot", forgotLimiter, async (req, res) => {
       );
       await client.query("COMMIT");
 
-      // best-effort email
+      // best-effort email (Yahoo mailer)
       sendEmail({
         to: email,
         subject: "Your password reset code",
@@ -302,7 +305,7 @@ router.post("/reset", resetLimiter, async (req, res) => {
 
     await client.query("COMMIT");
 
-    // best-effort notify
+    // best-effort notify (Yahoo mailer)
     sendEmail({
       to: email,
       subject: "Your password has been updated",

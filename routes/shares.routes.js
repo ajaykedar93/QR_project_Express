@@ -30,6 +30,12 @@ const otpVerifyLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+const notifyLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 /* -------------------------------- Create ------------------------------- */
 // POST /shares
@@ -221,7 +227,7 @@ router.get("/:share_id", auth, async (req, res) => {
   }
 });
 
-// GET /shares/:share_id/minimal (public scan)
+// GET /shares/:share_id/minimal (public/private scan)
 router.get("/:share_id/minimal", async (req, res) => {
   try {
     const { share_id } = req.params;
@@ -621,8 +627,8 @@ async function notifyShareHandler(req, res) {
     res.status(500).json({ error: err.message || "Server error" });
   }
 }
-router.post("/notify-share", auth, notifyShareHandler);
-router.post("/otp/notify-share", auth, notifyShareHandler);
+router.post("/notify-share", auth, notifyLimiter, notifyShareHandler);
+router.post("/otp/notify-share", auth, notifyLimiter, notifyShareHandler);
 
 /* ----------------------------- Delete doc ------------------------------- */
 // DELETE /shares/documents/:document_id  (hard delete; consider soft delete)
