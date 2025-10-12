@@ -39,7 +39,9 @@ const notifyLimiter = rateLimit({
 
 /* -------------------------------- Create ------------------------------- */
 // POST /shares
+// POST /shares  (idempotent)
 router.post("/", auth, async (req, res) => {
+  const client = await pool.connect();
   try {
     let { document_id, to_email = "", expiry_time = null, access = null } = req.body || {};
 
@@ -49,7 +51,7 @@ router.post("/", auth, async (req, res) => {
 
     if (!document_id) return res.status(400).json({ error: "document_id required" });
 
-    // Ownership
+    // Ownership check
     const owns = await pool.query(
       `SELECT 1 FROM documents WHERE document_id=$1 AND owner_user_id=$2 LIMIT 1`,
       [document_id, req.user.user_id]
@@ -63,7 +65,9 @@ router.post("/", auth, async (req, res) => {
         return res.status(400).json({ error: "expiry_time must be in the future" });
       }
       expiry_time = expiry;
-    } else expiry_time = null;
+    } else {
+      expiry_time = null;
+    }
 
     // Recipient resolution
     let to_user_id = null;
@@ -88,21 +92,62 @@ router.post("/", auth, async (req, res) => {
       finalAccess = to_user_id ? "private" : "public";
     }
 
+    // ---------- IDEMPOTENT LOOKUP ----------
+    // Find an existing active share (not revoked, not expired) with same identity.
+    // For public shares, there is no recipient, so we match on NULL recipient.
+    const existingSQL = `
+      SELECT
+        s.share_id, s.share_token, s.access, s.expiry_time, s.created_at
+      FROM shares s
+      WHERE s.document_id = $1
+        AND s.from_user_id = $2
+        AND s.access = $3
+        AND s.is_revoked = FALSE
+        AND (s.expiry_time IS NULL OR s.expiry_time > now())
+        AND (
+          ($4::uuid IS NOT NULL AND s.to_user_id = $4::uuid) OR
+          ($4::uuid IS NULL AND COALESCE(LOWER(s.to_user_email),'') = COALESCE(LOWER($5::text),''))
+        )
+      ORDER BY s.created_at DESC
+      LIMIT 1
+    `;
+    const existingArgs = [
+      document_id,
+      req.user.user_id,
+      finalAccess,
+      to_user_id,                         // $4
+      finalAccess === "public" ? null : to_email || null, // $5
+    ];
+    const ex = await pool.query(existingSQL, existingArgs);
+    if (ex.rowCount) {
+      const sh = ex.rows[0];
+      return res.status(200).json({
+        success: true,
+        reused: true,
+        message: "Active share already exists; reusing it.",
+        ...sh,
+        share_url: buildShareUrl(sh.share_token),
+      });
+    }
+
+    // ---------- CREATE NEW SHARE ----------
+    await client.query("BEGIN");
     const insertQuery = `
       INSERT INTO shares (document_id, from_user_id, to_user_id, to_user_email, access, expiry_time)
       VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING share_id, share_token, access, expiry_time, created_at
     `;
-    const { rows } = await pool.query(insertQuery, [
+    const { rows } = await client.query(insertQuery, [
       document_id,
       req.user.user_id,
       to_user_id,
-      to_user_id ? null : (to_email || null),
+      to_user_id ? null : (finalAccess === "public" ? null : (to_email || null)),
       finalAccess,
       expiry_time,
     ]);
-    const sh = rows[0];
+    await client.query("COMMIT");
 
+    const sh = rows[0];
     return res.status(201).json({
       success: true,
       message: "Document shared successfully",
@@ -110,8 +155,72 @@ router.post("/", auth, async (req, res) => {
       share_url: buildShareUrl(sh.share_token),
     });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+
+    // If a DB trigger/constraint still fired (race), re-query the existing share and return it.
+    const msg = String(err?.message || "").toLowerCase();
+    if (msg.includes("duplicate active private share")) {
+      try {
+        // Re-run the same idempotent lookup logic as above but using inputs from request again.
+        let { document_id, to_email = "", access = null } = req.body || {};
+        document_id = String(document_id || "").trim();
+        to_email = String(to_email || "").trim();
+        access = access ? String(access).toLowerCase() : null;
+
+        // Resolve access like before (minimal)
+        let to_user_id = null;
+        if (to_email) {
+          const u = await pool.query(`SELECT user_id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [to_email]);
+          if (u.rowCount) to_user_id = u.rows[0].user_id;
+        }
+        let finalAccess;
+        if (access === "private" && to_user_id) finalAccess = "private";
+        else if (access === "public") finalAccess = "public";
+        else finalAccess = to_user_id ? "private" : "public";
+
+        const existingSQL = `
+          SELECT s.share_id, s.share_token, s.access, s.expiry_time, s.created_at
+            FROM shares s
+           WHERE s.document_id = $1
+             AND s.from_user_id = $2
+             AND s.access = $3
+             AND s.is_revoked = FALSE
+             AND (s.expiry_time IS NULL OR s.expiry_time > now())
+             AND (
+               ($4::uuid IS NOT NULL AND s.to_user_id = $4::uuid) OR
+               ($4::uuid IS NULL AND COALESCE(LOWER(s.to_user_email),'') = COALESCE(LOWER($5::text),''))
+             )
+           ORDER BY s.created_at DESC
+           LIMIT 1
+        `;
+        const existingArgs = [
+          document_id,
+          req.user.user_id,
+          finalAccess,
+          to_user_id,
+          finalAccess === "public" ? null : to_email || null,
+        ];
+        const ex = await pool.query(existingSQL, existingArgs);
+        if (ex.rowCount) {
+          const sh = ex.rows[0];
+          return res.status(200).json({
+            success: true,
+            reused: true,
+            message: "Active share already exists; reusing it.",
+            ...sh,
+            share_url: buildShareUrl(sh.share_token),
+          });
+        }
+      } catch (e2) {
+        // fallthrough to generic error below
+        console.error("SHARE_CREATE_RERESOLVE_ERROR:", e2);
+      }
+    }
+
     console.error("SHARE_CREATE_ERROR:", err);
     return res.status(400).json({ error: err?.message || "Cannot create share" });
+  } finally {
+    client.release();
   }
 });
 
