@@ -7,6 +7,8 @@ import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
 import { sendEmail } from "../utils/mailer.js"; // Yahoo mailer (EMAIL_USER/EMAIL_PASS)
 import "dotenv/config";
+import { verifyMailer } from "./utils/mailer.js";
+verifyMailer().catch((e)=>console.error("SMTP verify failed:", e));
 
 const router = Router();
 

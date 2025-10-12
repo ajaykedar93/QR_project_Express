@@ -7,6 +7,8 @@ import { auth } from "../middleware/auth.js";
 import { sendEmail } from "../utils/mailer.js";
 
 const router = Router();
+import { verifyMailer } from "./utils/mailer.js";
+verifyMailer().catch((e)=>console.error("SMTP verify failed:", e));
 
 /* ------------------------------- Config -------------------------------- */
 const APP_URL = (process.env.FRONTEND_URL || "https://qr-project-react.vercel.app/").replace(/\/$/, "");
