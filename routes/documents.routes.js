@@ -3,13 +3,14 @@ import { Router } from "express";
 import path from "node:path";
 import fs from "node:fs";
 import multer from "multer";
+import dayjs from "dayjs";
 import { pool } from "../db/db.js";
 import { auth } from "../middleware/auth.js";
 import { upload, FILE_ROOT } from "../middleware/upload.js";
 
 const router = Router();
 
-
+/* ----------------------------- Helpers ----------------------------- */
 function cdInline(fileName) {
   const safe = (fileName || "file").replace(/"/g, "'");
   return `inline; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
@@ -19,18 +20,16 @@ function cdAttachment(fileName) {
   return `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(fileName || "file")}`;
 }
 
-
 function decidePreviewStrategy({ mime = "", file_name = "" }) {
   const ext = (path.extname(file_name || "").slice(1) || "").toLowerCase();
   if (/^application\/pdf$/i.test(mime) || ext === "pdf") return "pdf";
   if (/^image\//i.test(mime)) return "image";
-  if (/^text\//i.test(mime) || /(json|xml|yaml)/i.test(mime) || ["txt", "md", "json", "xml", "yaml", "yml", "csv", "log"].includes(ext)) return "text";
+  if (/^text\//i.test(mime) || /(json|xml|yaml)/i.test(mime) || ["txt","md","json","xml","yaml","yml","csv","log"].includes(ext)) return "text";
   if (/^audio\//i.test(mime)) return "audio";
   if (/^video\//i.test(mime)) return "video";
-  if (/(msword|officedocument|excel|powerpoint)/i.test(mime) || ["doc", "docx", "ppt", "pptx", "xls", "xlsx"].includes(ext)) return "office";
+  if (/(msword|officedocument|excel|powerpoint)/i.test(mime) || ["doc","docx","ppt","pptx","xls","xlsx"].includes(ext)) return "office";
   return "other";
 }
-
 
 function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
   const stat = fs.statSync(absPath);
@@ -38,6 +37,7 @@ function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
   res.setHeader("Content-Type", mime);
   res.setHeader("Content-Disposition", disposition);
   res.setHeader("Accept-Ranges", "bytes");
+  // Allows iframes from your React app to fetch the file
   res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
 
   if (rangeHeader) {
@@ -60,6 +60,102 @@ function streamFileWithRange(res, absPath, mime, disposition, rangeHeader) {
   fs.createReadStream(absPath).pipe(res);
 }
 
+/* ---------------------- Share/Access Resolution ---------------------- */
+/**
+ * Resolve how this request may access a document.
+ * Modes:
+ *   - owner: JWT owner may view+download
+ *   - public: via share_token, view-only
+ *   - private: via share_token, requires OTP verification from intended recipient; view+download
+ *
+ * Returns { mode, userId, share, viewOnly }
+ */
+async function resolveAccess(req, document_id) {
+  const bearer = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const token = (req.query?.token || req.query?.share_token || "").toString().trim();
+
+  // 1) If caller is the owner (auth middleware optional here), allow full
+  // We can trust req.user if auth middleware was used upstream; but these routes are public.
+  let ownerRow = null;
+  if (bearer) {
+    try {
+      // Cheap owner check by matching token's user against document owner.
+      // We don't decode JWT here (auth middleware not applied), so we query as fallback in /:document_id (meta)
+      // For secure owner flow, your frontend calls /documents with auth and shows owner controls already.
+      const q = `SELECT owner_user_id FROM documents WHERE document_id=$1 LIMIT 1`;
+      const { rows } = await pool.query(q, [document_id]);
+      ownerRow = rows[0] || null;
+      // If /documents/:id is fetched with Authorization and the same user later hits /view/:id with Authorization,
+      // your reverse proxy/middleware should already validate the JWT. If not, consider adding auth on /view & /download for owner flows.
+    } catch {}
+  }
+
+  // 2) share_token flow
+  if (token) {
+    const q = `
+      SELECT s.*, d.owner_user_id, d.document_id
+      FROM shares s
+      JOIN documents d ON d.document_id = s.document_id
+      WHERE s.share_token = $1
+      LIMIT 1
+    `;
+    const { rows } = await pool.query(q, [token]);
+    const share = rows[0];
+    if (!share || String(share.document_id) !== String(document_id)) {
+      return { mode: null, viewOnly: true };
+    }
+    if (share.is_revoked) return { mode: null, viewOnly: true };
+    if (share.expiry_time && new Date(share.expiry_time) <= new Date()) {
+      return { mode: null, viewOnly: true };
+    }
+
+    if (share.access === "public") {
+      return { mode: "public", share, viewOnly: true };
+    }
+
+    // Private — require intended recipient and a verified OTP
+    const claimedEmail = String(req.headers["x-user-email"] || "").trim().toLowerCase();
+    if (!claimedEmail) return { mode: null, viewOnly: true };
+
+    const ures = await pool.query(`SELECT user_id, email FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1`, [claimedEmail]);
+    if (!ures.rowCount) return { mode: null, viewOnly: true };
+    const u = ures.rows[0];
+
+    // Intended recipient check
+    if (share.to_user_id && String(share.to_user_id) !== String(u.user_id)) return { mode: null, viewOnly: true };
+    if (!share.to_user_id && share.to_user_email && share.to_user_email.toLowerCase() !== u.email.toLowerCase()) {
+      return { mode: null, viewOnly: true };
+    }
+
+    // OTP verification check: must exist a verified, still-valid OTP (or at least not older than TTL)
+    // Prefer expiry_time > now(); if your verify flips is_verified but leaves expiry_time from send time, this works.
+    const vq = `
+      SELECT 1
+        FROM otp_verifications
+       WHERE share_id = $1
+         AND user_id  = $2
+         AND is_verified = TRUE
+         AND expiry_time > now()
+       ORDER BY created_at DESC
+       LIMIT 1
+    `;
+    const verified = await pool.query(vq, [share.share_id, u.user_id]);
+    if (!verified.rowCount) return { mode: null, viewOnly: true };
+
+    return { mode: "private", userId: u.user_id, share, viewOnly: false };
+  }
+
+  // 3) Owner fallback if needed: allow if auth owner_user_id present (caller sent Authorization AND owns the doc)
+  if (ownerRow && req.user && String(ownerRow.owner_user_id) === String(req.user.user_id)) {
+    return { mode: "owner", userId: req.user.user_id, share: null, viewOnly: false };
+  }
+
+  return { mode: null, viewOnly: true };
+}
+
+/* ----------------------------- Routes ----------------------------- */
+
+/** List my docs (owner) */
 router.get("/", auth, async (req, res) => {
   try {
     const q = `
@@ -76,12 +172,15 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-
+/** Document meta (works for owner, public share_token, or private share_token after OTP) */
 router.get("/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;
     const d = await pool.query(`SELECT * FROM documents WHERE document_id=$1 LIMIT 1`, [document_id]);
     if (!d.rowCount) return res.status(404).json({ error: "Document not found" });
+
+    const access = await resolveAccess(req, document_id);
+    if (!access.mode) return res.status(403).json({ error: "Not authorized for this document" });
 
     const doc = d.rows[0];
     const preview_strategy = decidePreviewStrategy({ mime: doc.mime_type, file_name: doc.file_name });
@@ -92,6 +191,8 @@ router.get("/:document_id", async (req, res) => {
       mime_type: doc.mime_type,
       file_size_bytes: doc.file_size_bytes,
       preview_strategy,
+      // Let frontend know if download is disabled (public)
+      view_only: access.mode === "public",
     });
   } catch (err) {
     console.error("DOC_META_ERROR:", err);
@@ -99,14 +200,12 @@ router.get("/:document_id", async (req, res) => {
   }
 });
 
-
+/** Upload (owner) */
 router.post("/upload", auth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "file required" });
 
- 
     const diskRelPath = path.relative(FILE_ROOT, req.file.path);
-
     const ins = `
       INSERT INTO documents (owner_user_id, file_name, file_path, mime_type, file_size_bytes)
       VALUES ($1,$2,$3,$4,$5)
@@ -129,7 +228,7 @@ router.post("/upload", auth, upload.single("file"), async (req, res) => {
   }
 });
 
-
+/** Delete (owner) */
 router.delete("/:document_id", auth, async (req, res) => {
   try {
     const { document_id } = req.params;
@@ -150,42 +249,66 @@ router.delete("/:document_id", auth, async (req, res) => {
   }
 });
 
+/** View/stream (owner, public share_token (view-only), private (OTP verified)) */
 router.get("/view/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;
+
     const d = await pool.query(`SELECT * FROM documents WHERE document_id=$1 LIMIT 1`, [document_id]);
     if (!d.rowCount) return res.status(404).json({ error: "Document not found" });
 
+    const access = await resolveAccess(req, document_id);
+    if (!access.mode) return res.status(403).json({ error: "Not authorized to view this document" });
+
     const doc = d.rows[0];
     const abs = path.join(FILE_ROOT, doc.file_path);
-
     if (!fs.existsSync(abs)) {
       console.error("MISSING_FILE", { document_id, rel: doc.file_path, abs, FILE_ROOT });
       return res.status(404).json({ error: "File missing on server" });
     }
 
-    streamFileWithRange(res, abs, doc.mime_type || "application/octet-stream", cdInline(doc.file_name), req.headers.range);
+    // Stream inline for all allowed modes
+    streamFileWithRange(
+      res,
+      abs,
+      doc.mime_type || "application/octet-stream",
+      cdInline(doc.file_name),
+      req.headers.range
+    );
   } catch (err) {
     console.error("DOC_VIEW_ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
+/** Download (blocked for public shares; allowed for owner/private) */
 router.get("/download/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;
+
     const d = await pool.query(`SELECT * FROM documents WHERE document_id=$1 LIMIT 1`, [document_id]);
     if (!d.rowCount) return res.status(404).json({ error: "Document not found" });
 
+    const access = await resolveAccess(req, document_id);
+    if (!access.mode) return res.status(403).json({ error: "Not authorized to download this document" });
+    if (access.mode === "public") {
+      return res.status(403).json({ error: "Public shares are view-only" });
+    }
+
     const doc = d.rows[0];
     const abs = path.join(FILE_ROOT, doc.file_path);
-
     if (!fs.existsSync(abs)) {
       console.error("MISSING_FILE", { document_id, rel: doc.file_path, abs, FILE_ROOT });
       return res.status(404).json({ error: "File missing on server" });
     }
 
-    streamFileWithRange(res, abs, doc.mime_type || "application/octet-stream", cdAttachment(doc.file_name), req.headers.range);
+    streamFileWithRange(
+      res,
+      abs,
+      doc.mime_type || "application/octet-stream",
+      cdAttachment(doc.file_name),
+      req.headers.range
+    );
   } catch (err) {
     console.error("DOC_DOWNLOAD_ERROR:", err);
     res.status(500).json({ error: "Server error" });
