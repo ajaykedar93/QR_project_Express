@@ -228,16 +228,24 @@ router.get("/:share_id", auth, async (req, res) => {
 });
 
 // GET /shares/:share_id/minimal (public/private scan)
+// GET /shares/:share_id/minimal
 router.get("/:share_id/minimal", async (req, res) => {
   try {
     const { share_id } = req.params;
+    const { token } = req.query;
+
     const q = `
       SELECT share_id, document_id, access, expiry_time, is_revoked, to_user_email
       FROM shares
-      WHERE share_id = $1
+      WHERE ($1::uuid IS NOT NULL AND share_id = $1::uuid)
+         OR ($2::text IS NOT NULL AND share_token = $2::text)
       LIMIT 1
     `;
-    const { rows } = await pool.query(q, [share_id]);
+    const { rows } = await pool.query(q, [
+      // try to coerce to uuid; if not uuid, pass null so token branch is used
+      /^[0-9a-f-]{36}$/i.test(share_id) ? share_id : null,
+      token || (!/^[0-9a-f-]{36}$/i.test(share_id) ? share_id : null) // treat path as token if not uuid
+    ]);
     if (!rows.length) return res.status(404).json({ error: "Share not found" });
 
     const s = rows[0];
