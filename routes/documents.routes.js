@@ -292,13 +292,19 @@ router.delete("/:document_id", auth, async (req, res) => {
 });
 
 /** 👁 View/Stream document (owner, public, private verified) */
+/** 👁 View/Stream document (owner direct, or shared public/private verified) */
 router.get("/view/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;
-    const { viewOnly, share_token, share_id } = req.query;
+    const { viewOnly } = req.query;
 
-    const d = await pool.query(`SELECT * FROM documents WHERE document_id=$1 LIMIT 1`, [document_id]);
-    if (!d.rowCount) return res.status(404).json({ error: "Document not found" });
+    // --- Fetch document ---
+    const d = await pool.query(
+      `SELECT * FROM documents WHERE document_id=$1 LIMIT 1`,
+      [document_id]
+    );
+    if (!d.rowCount)
+      return res.status(404).json({ error: "Document not found" });
 
     const doc = d.rows[0];
     const abs = path.join(FILE_ROOT, doc.file_path);
@@ -308,26 +314,60 @@ router.get("/view/:document_id", async (req, res) => {
       return res.status(404).json({ error: "File missing on server" });
     }
 
-    // 🔹 Allow if:
-    // 1. share_token access valid
-    // 2. owner (auth token matches uploader_id)
-    // 3. public viewOnly=1 (safe read-only mode)
+    // --- Access control ---
     let authorized = false;
-    if (viewOnly === "1") {
-      authorized = true; // ✅ allow public inline viewing only
-    } else {
+
+    // 1️⃣ Owner direct access (only if logged in with valid token)
+    if (req.headers.authorization) {
+      try {
+        const bearer = req.headers.authorization.replace(/^Bearer\s+/i, "");
+        const q = `SELECT user_id FROM users WHERE user_id = (SELECT owner_user_id FROM documents WHERE document_id=$1)`;
+        const { rows } = await pool.query(q, [document_id]);
+        if (
+          rows.length &&
+          req.user &&
+          String(req.user.user_id) === String(rows[0].user_id)
+        ) {
+          authorized = true;
+        }
+      } catch (err) {
+        console.error("OWNER_CHECK_ERROR:", err);
+      }
+    }
+
+    // 2️⃣ Shared access (public/private/OTP verified)
+    if (!authorized) {
       const access = await resolveAccess(req, document_id);
       if (access.mode) authorized = true;
     }
 
-    if (!authorized) return res.status(403).json({ error: "Not authorized for this document" });
+    // 3️⃣ Allow owner dashboard preview shortcut (?viewOnly=1)
+    // This is for your dashboard open button
+    if (!authorized && viewOnly === "1" && req.headers.authorization) {
+      const q2 = `SELECT owner_user_id FROM documents WHERE document_id=$1 LIMIT 1`;
+      const { rows } = await pool.query(q2, [document_id]);
+      if (
+        rows.length &&
+        req.user &&
+        String(rows[0].owner_user_id) === String(req.user.user_id)
+      ) {
+        authorized = true;
+      }
+    }
 
-    // Stream inline
+    // ❌ Still not authorized
+    if (!authorized)
+      return res.status(403).json({ error: "Not authorized to view this document" });
+
+    // --- Stream the file ---
+    const mimeType =
+      doc.mime_type || mime.lookup(abs) || "application/octet-stream";
+
     res.setHeader("Cache-Control", "public, max-age=3600");
     streamFileWithRange(
       res,
       abs,
-      doc.mime_type || "application/octet-stream",
+      mimeType,
       cdInline(doc.file_name),
       req.headers.range
     );
@@ -336,6 +376,7 @@ router.get("/view/:document_id", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
 
 /** 💾 Download (owner or private verified only) */
 router.get("/download/:document_id", async (req, res) => {
