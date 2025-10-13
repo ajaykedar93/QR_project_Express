@@ -238,9 +238,18 @@ router.get("/mine", auth, async (req, res) => {
   }
 });
 
-// GET /shares/received
+/**
+ * GET /shares/received
+ * Return shares sent to the current user that are:
+ * - Not revoked
+ * - Not expired
+ * - Not dismissed by this user
+ */
 router.get("/received", auth, async (req, res) => {
   try {
+    const meId = req.user.user_id;
+    const meEmail = (req.user.email || "").toLowerCase();
+
     const q = `
       SELECT
         s.share_id,
@@ -266,35 +275,33 @@ router.get("/received", auth, async (req, res) => {
         AND sd.share_id IS NULL
         AND (
              s.to_user_id = $1
-             OR (s.to_user_id IS NULL AND LOWER(s.to_user_email) = LOWER($2))
+             OR (s.to_user_id IS NULL AND s.to_user_email IS NOT NULL AND LOWER(s.to_user_email) = $2)
         )
       ORDER BY s.created_at DESC
     `;
-    const { rows } = await pool.query(q, [req.user.user_id, req.user.email]);
-    res.json({ success: true, total: rows.length, received: rows });
+    const { rows } = await pool.query(q, [meId, meEmail]);
+    return res.json({ success: true, total: rows.length, received: rows });
   } catch (err) {
     console.error("SHARES_RECEIVED_ERROR:", err);
-    res.status(500).json({ error: "Server error fetching received documents" });
+    return res.status(500).json({ error: "Server error fetching received documents" });
   }
 });
 
-
-
 /**
  * DELETE /shares/received/:share_id
- * "Delete" a received share for the current user (recipient) by dismissing it.
- * - Does NOT delete the share globally; only hides it for this recipient.
- * - Allowed when the share is addressed to the user:
- *   * s.to_user_id = me
- *   * OR s.to_user_id IS NULL AND LOWER(s.to_user_email) = LOWER(me.email)
+ * Dismiss a received share so it disappears from the current user's Received list.
+ * - Does NOT delete the share globally.
+ * - Only the intended recipient can dismiss.
  */
 router.delete("/received/:share_id", auth, async (req, res) => {
   try {
     const { share_id } = req.params;
+    const meId = req.user.user_id;
+    const meEmail = (req.user.email || "").toLowerCase();
 
     // 1) Load share
     const qShare = `
-      SELECT s.share_id, s.to_user_id, s.to_user_email, s.access
+      SELECT s.share_id, s.to_user_id, s.to_user_email
       FROM shares s
       WHERE s.share_id = $1
       LIMIT 1
@@ -306,19 +313,16 @@ router.delete("/received/:share_id", auth, async (req, res) => {
     const share = sres.rows[0];
 
     // 2) Authorize: only the intended recipient can dismiss
-    const meId = req.user.user_id;
-    const meEmail = (req.user.email || "").toLowerCase();
+    const isRecipientById =
+      share.to_user_id && String(share.to_user_id) === String(meId);
 
-    const isRecipientById = share.to_user_id && String(share.to_user_id) === String(meId);
     const isRecipientByEmail =
       !share.to_user_id &&
       share.to_user_email &&
       share.to_user_email.toLowerCase() === meEmail;
 
     if (!(isRecipientById || isRecipientByEmail)) {
-      return res
-        .status(403)
-        .json({ error: "You can only remove shares that were sent to you." });
+      return res.status(403).json({ error: "You can only remove shares that were sent to you." });
     }
 
     // 3) Upsert dismissal (idempotent)
@@ -330,17 +334,9 @@ router.delete("/received/:share_id", auth, async (req, res) => {
     `;
     const dres = await pool.query(qDismiss, [share_id, meId]);
 
-    // Optional: you can log this in access_logs if you like, using an existing action name
-    // await pool.query(
-    //   `INSERT INTO access_logs (share_id, viewer_user_id, action)
-    //    VALUES ($1, $2, 'share_delete')`,
-    //   [share_id, meId]
-    // );
-
-    // 4) Respond
     return res.json({
       success: true,
-      dismissed: dres.rowCount > 0,
+      dismissed: dres.rowCount > 0, // false if it was already dismissed before
       share_id,
     });
   } catch (err) {
