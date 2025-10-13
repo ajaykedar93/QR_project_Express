@@ -278,6 +278,78 @@ router.get("/received", auth, async (req, res) => {
   }
 });
 
+
+
+/**
+ * DELETE /shares/received/:share_id
+ * "Delete" a received share for the current user (recipient) by dismissing it.
+ * - Does NOT delete the share globally; only hides it for this recipient.
+ * - Allowed when the share is addressed to the user:
+ *   * s.to_user_id = me
+ *   * OR s.to_user_id IS NULL AND LOWER(s.to_user_email) = LOWER(me.email)
+ */
+router.delete("/received/:share_id", auth, async (req, res) => {
+  try {
+    const { share_id } = req.params;
+
+    // 1) Load share
+    const qShare = `
+      SELECT s.share_id, s.to_user_id, s.to_user_email, s.access
+      FROM shares s
+      WHERE s.share_id = $1
+      LIMIT 1
+    `;
+    const sres = await pool.query(qShare, [share_id]);
+    if (!sres.rowCount) {
+      return res.status(404).json({ error: "Share not found" });
+    }
+    const share = sres.rows[0];
+
+    // 2) Authorize: only the intended recipient can dismiss
+    const meId = req.user.user_id;
+    const meEmail = (req.user.email || "").toLowerCase();
+
+    const isRecipientById = share.to_user_id && String(share.to_user_id) === String(meId);
+    const isRecipientByEmail =
+      !share.to_user_id &&
+      share.to_user_email &&
+      share.to_user_email.toLowerCase() === meEmail;
+
+    if (!(isRecipientById || isRecipientByEmail)) {
+      return res
+        .status(403)
+        .json({ error: "You can only remove shares that were sent to you." });
+    }
+
+    // 3) Upsert dismissal (idempotent)
+    const qDismiss = `
+      INSERT INTO share_dismissals (share_id, user_id)
+      VALUES ($1, $2)
+      ON CONFLICT (share_id, user_id) DO NOTHING
+      RETURNING share_id, user_id, dismissed_at
+    `;
+    const dres = await pool.query(qDismiss, [share_id, meId]);
+
+    // Optional: you can log this in access_logs if you like, using an existing action name
+    // await pool.query(
+    //   `INSERT INTO access_logs (share_id, viewer_user_id, action)
+    //    VALUES ($1, $2, 'share_delete')`,
+    //   [share_id, meId]
+    // );
+
+    // 4) Respond
+    return res.json({
+      success: true,
+      dismissed: dres.rowCount > 0,
+      share_id,
+    });
+  } catch (err) {
+    console.error("DISMISS_RECEIVED_SHARE_ERROR:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+
 /* ------------------------------ Get One --------------------------------- */
 // GET /shares/:share_id (owner detail)
 router.get("/:share_id", auth, async (req, res) => {
