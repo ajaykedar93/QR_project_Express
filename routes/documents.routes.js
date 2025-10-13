@@ -295,37 +295,39 @@ router.delete("/:document_id", auth, async (req, res) => {
 router.get("/view/:document_id", async (req, res) => {
   try {
     const { document_id } = req.params;
+    const { viewOnly, share_token, share_id } = req.query;
 
-    const d = await pool.query(
-      `SELECT * FROM documents WHERE document_id=$1 LIMIT 1`,
-      [document_id]
-    );
-    if (!d.rowCount)
-      return res.status(404).json({ error: "Document not found" });
-
-    const access = await resolveAccess(req, document_id);
-    if (!access.mode)
-      return res.status(403).json({ error: "Not authorized to view" });
+    const d = await pool.query(`SELECT * FROM documents WHERE document_id=$1 LIMIT 1`, [document_id]);
+    if (!d.rowCount) return res.status(404).json({ error: "Document not found" });
 
     const doc = d.rows[0];
     const abs = path.join(FILE_ROOT, doc.file_path);
+
     if (!fs.existsSync(abs)) {
-      console.error("MISSING_FILE", {
-        document_id,
-        rel: doc.file_path,
-        abs,
-        FILE_ROOT,
-      });
+      console.error("MISSING_FILE", { document_id, rel: doc.file_path, abs });
       return res.status(404).json({ error: "File missing on server" });
     }
 
-    const mimeType =
-      doc.mime_type || mime.lookup(abs) || "application/octet-stream";
+    // 🔹 Allow if:
+    // 1. share_token access valid
+    // 2. owner (auth token matches uploader_id)
+    // 3. public viewOnly=1 (safe read-only mode)
+    let authorized = false;
+    if (viewOnly === "1") {
+      authorized = true; // ✅ allow public inline viewing only
+    } else {
+      const access = await resolveAccess(req, document_id);
+      if (access.mode) authorized = true;
+    }
 
+    if (!authorized) return res.status(403).json({ error: "Not authorized for this document" });
+
+    // Stream inline
+    res.setHeader("Cache-Control", "public, max-age=3600");
     streamFileWithRange(
       res,
       abs,
-      mimeType,
+      doc.mime_type || "application/octet-stream",
       cdInline(doc.file_name),
       req.headers.range
     );
